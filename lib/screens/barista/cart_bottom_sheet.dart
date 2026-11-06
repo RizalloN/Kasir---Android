@@ -58,6 +58,18 @@ class _CartBottomSheetState extends State<CartBottomSheet> {
     super.dispose();
   }
 
+  Future<void> _saveOrder(PosProvider pos) async {
+    try {
+      await pos.saveCurrentBill();
+      if (!mounted) return;
+      _customerController.clear();
+      AppTheme.showToast(context, message: 'Pesanan disimpan. Buka riwayat pesanan untuk memperbaikinya sebelum pembayaran.');
+      if (!widget.isTabletSidebar) Navigator.pop(context);
+    } catch (e) {
+      if (mounted) AppTheme.showToast(context, message: e.toString().replaceFirst('Bad state: ', ''), isError: true);
+    }
+  }
+
   List<double> _buildSmartCashOptions(double total) {
     final candidates = <double>{50000, 100000, 200000};
     final roundedUp20k = ((total / 20000).ceil() * 20000).toDouble();
@@ -69,7 +81,7 @@ class _CartBottomSheetState extends State<CartBottomSheet> {
   }
 
   void _openItemNoteDialog(BuildContext context, PosProvider pos, CartItem item) {
-    final noteCtrl = TextEditingController(text: item.note ?? '');
+    final noteCtrl = TextEditingController(text: item.customerNote ?? '');
     showDialog(
       context: context,
       builder: (ctx) => StatefulBuilder(
@@ -148,10 +160,10 @@ class _CartBottomSheetState extends State<CartBottomSheet> {
                     const SizedBox(height: 16),
                     Row(
                       children: [
-                        if (item.note != null && item.note!.isNotEmpty) ...[
+                        if (item.customerNote != null) ...[
                           TextButton(
                             onPressed: () {
-                              pos.updateItemNote(item.product.id, null);
+                              pos.updateItemNote(item.product.id, null, variant: item.drinkVariant);
                               Navigator.of(ctx).pop();
                             },
                             child: const Text(
@@ -169,7 +181,7 @@ class _CartBottomSheetState extends State<CartBottomSheet> {
                         const SizedBox(width: 8),
                         ElevatedButton(
                           onPressed: () {
-                            pos.updateItemNote(item.product.id, noteCtrl.text);
+                            pos.updateItemNote(item.product.id, noteCtrl.text, variant: item.drinkVariant);
                             Navigator.of(ctx).pop();
                           },
                           child: const Text('Simpan'),
@@ -673,17 +685,6 @@ class _CartBottomSheetState extends State<CartBottomSheet> {
                 ),
                 const Spacer(),
                 if (pos.cart.isNotEmpty)
-                  IconButton(tooltip: 'Simpan Tagihan', icon: const Icon(Icons.save_outlined), onPressed: _checkingOut ? null : () async {
-                    try {
-                      await pos.saveCurrentBill();
-                      if (!context.mounted) return;
-                      AppTheme.showToast(context, message: 'Tagihan disimpan. Stok dan pendapatan belum berubah.');
-                      if (!widget.isTabletSidebar) Navigator.pop(context);
-                    } catch (e) {
-                      if (context.mounted) AppTheme.showToast(context, message: e.toString().replaceFirst('Bad state: ', ''), isError: true);
-                    }
-                  }),
-                if (pos.cart.isNotEmpty)
                   TextButton.icon(
                     style: TextButton.styleFrom(
                       visualDensity: VisualDensity.compact,
@@ -752,6 +753,18 @@ class _CartBottomSheetState extends State<CartBottomSheet> {
           const Divider(height: 1),
           ])),
 
+          if (pos.cart.isNotEmpty)
+            SliverToBoxAdapter(
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(14, 12, 14, 0),
+                child: OutlinedButton.icon(
+                  onPressed: _checkingOut ? null : () => _saveOrder(pos),
+                  icon: const Icon(Icons.save_outlined),
+                  label: const Text('Simpan Pesanan untuk Diperbaiki'),
+                ),
+              ),
+            ),
+
           // One scroll surface keeps all controls reachable with a keyboard or short window.
           if (pos.cart.isEmpty)
             SliverFillRemaining(hasScrollBody: false, child: Center(
@@ -801,7 +814,7 @@ class _CartBottomSheetState extends State<CartBottomSheet> {
                     separatorBuilder: (_, __) => const SizedBox(height: 8),
                     itemBuilder: (context, index) {
                       final item = pos.cart[index];
-                      final hasNote = item.note != null && item.note!.isNotEmpty;
+                      final hasNote = item.customerNote != null;
 
                       return Container(
                         padding: const EdgeInsets.symmetric(
@@ -822,6 +835,25 @@ class _CartBottomSheetState extends State<CartBottomSheet> {
                               overflow: TextOverflow.ellipsis,
                               style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 13, color: AppTheme.textMain),
                             ),
+                            if (item.product.isDrink)
+                              PopupMenuButton<String>(
+                                tooltip: 'Pilih varian minuman',
+                                onSelected: (variant) {
+                                  if (!pos.setDrinkVariant(item.product.id, item.drinkVariant, variant)) {
+                                    AppTheme.showToast(context, message: 'Varian sudah ada dengan catatan berbeda. Sesuaikan catatan terlebih dahulu.', isWarning: true);
+                                  }
+                                },
+                                itemBuilder: (_) => const [
+                                  PopupMenuItem(value: 'Panas', child: Text('Panas · harga asli')),
+                                  PopupMenuItem(value: 'ES', child: Text('ES · +Rp1.000')),
+                                  PopupMenuItem(value: 'Jumbo', child: Text('Jumbo · +Rp3.000')),
+                                ],
+                                child: Padding(
+                                  padding: const EdgeInsets.symmetric(vertical: 4),
+                                  child: Text(item.drinkVariant == null ? 'Pilih varian minuman' : 'Varian: ${item.drinkVariant}  ▾',
+                                      style: const TextStyle(color: AppTheme.accentAmber, fontWeight: FontWeight.w700, fontSize: 11.5)),
+                                ),
+                              ),
                             const SizedBox(height: 6),
                             Text(
                               '${CurrencyFormatter.format(item.product.sellPrice)} / ${item.product.unitLabel}',
@@ -838,12 +870,12 @@ class _CartBottomSheetState extends State<CartBottomSheet> {
                                   onPressed: () => _openItemNoteDialog(context, pos, item),
                                   icon: Icon(hasNote ? Icons.sticky_note_2_rounded : Icons.note_add_outlined, size: 17, color: AppTheme.accentAmber),
                                 ),
-                                _buildStepperButton(icon: Icons.remove_rounded, onTap: () => pos.updateQuantity(item.product.id, -1)),
+                                _buildStepperButton(icon: Icons.remove_rounded, onTap: () => pos.updateQuantity(item.product.id, -1, variant: item.drinkVariant)),
                                 Text('${item.quantity}', style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w800)),
                                 _buildStepperButton(
                                   icon: Icons.add_rounded,
                                   onTap: () {
-                                    final ok = pos.updateQuantity(item.product.id, 1);
+                                    final ok = pos.updateQuantity(item.product.id, 1, variant: item.drinkVariant);
                                     if (!ok) AppTheme.showToast(context, message: 'Stok maksimal (${item.product.stock}) tercapai.', isWarning: true);
                                   },
                                 ),
@@ -874,7 +906,7 @@ class _CartBottomSheetState extends State<CartBottomSheet> {
                                       const SizedBox(width: 4),
                                       Flexible(
                                         child: Text(
-                                          item.note!,
+                                          item.customerNote!,
                                           style: const TextStyle(
                                             fontSize: 11,
                                             fontWeight: FontWeight.w600,

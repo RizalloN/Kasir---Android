@@ -236,12 +236,15 @@ class PosProvider extends ChangeNotifier {
     final bill = openBills.where((b) => b.id == id).firstOrNull;
     if (bill == null) throw StateError('Tagihan tidak ditemukan atau akses ditolak.');
     final resolved = <CartItem>[];
+    final quantities = <String, int>{};
     for (final item in bill.items) {
       final live = _products.where((p) => p.id == item.product.id).firstOrNull;
-      if (live == null || !live.isAvailable || item.quantity > live.stock || item.quantity < 1) {
+      final total = (quantities[item.product.id] ?? 0) + item.quantity;
+      if (live == null || !live.isAvailable || total > live.stock || item.quantity < 1) {
         throw StateError('Stok/menu tagihan berubah. Periksa inventori terlebih dahulu.');
       }
-      resolved.add(item.copyWith(product: live));
+      quantities[item.product.id] = total;
+      resolved.add(item.copyWith(product: live.copyWith(sellPrice: live.sellPrice + (CartItem.variantPrices[item.drinkVariant] ?? 0))));
     }
     _cart.addAll(resolved);
     _customerName = bill.customerName;
@@ -394,15 +397,17 @@ class PosProvider extends ChangeNotifier {
   void _reconcileCartWithCatalog() {
     if (_cart.isEmpty) return;
     final byId = {for (final p in _products) p.id: p};
+    final remaining = {for (final p in _products) p.id: p.stock};
     for (int i = _cart.length - 1; i >= 0; i--) {
       final live = byId[_cart[i].product.id];
-      if (live == null || !live.isAvailable || live.stock <= 0) {
+      if (live == null || !live.isAvailable || (remaining[live.id] ?? 0) <= 0) {
         _cart.removeAt(i);
       } else {
-        _cart[i].product = live;
-        if (_cart[i].quantity > live.stock) {
-          _cart[i].quantity = live.stock;
+        _cart[i].product = live.copyWith(sellPrice: live.sellPrice + (CartItem.variantPrices[_cart[i].drinkVariant] ?? 0));
+        if (_cart[i].quantity > remaining[live.id]!) {
+          _cart[i].quantity = remaining[live.id]!;
         }
+        remaining[live.id] = remaining[live.id]! - _cart[i].quantity;
       }
     }
     if (_selectedCategory != 'Semua' &&
@@ -520,6 +525,12 @@ class PosProvider extends ChangeNotifier {
     _users = _db.getUsers();
     notifyListeners();
     return success;
+  }
+
+  Future<void> resetDefaultPasswords() async {
+    await _db.resetDefaultPasswords();
+    _users = _db.getUsers();
+    notifyListeners();
   }
 
   // Printer Preferences
@@ -719,15 +730,19 @@ class PosProvider extends ChangeNotifier {
   }
 
   /// Adds product to cart. Returns false if unavailable or stock limit reached.
-  bool addToCart(Product product, {String? note}) {
+  bool addToCart(Product product, {String? note, String? variant}) {
     if (!isAuthenticated || _checkoutInProgress || _savingBill) return false;
     final catalog = _products.where((p) => p.id == product.id).firstOrNull;
     if (catalog == null) return false;
     product = catalog;
+    if (variant != null && (!CartItem.variantPrices.containsKey(variant) || !product.isDrink)) return false;
     if (!product.isAvailable || product.stock <= 0) return false;
 
+    final totalQuantity = _cart.where((item) => item.product.id == product.id).fold<int>(0, (sum, item) => sum + item.quantity);
+    if (totalQuantity >= product.stock) return false;
+
     final existingIndex = _cart.indexWhere(
-      (item) => item.product.id == product.id,
+      (item) => item.product.id == product.id && item.drinkVariant == variant,
     );
     if (existingIndex != -1) {
       if (_cart[existingIndex].quantity >= product.stock) {
@@ -735,14 +750,14 @@ class PosProvider extends ChangeNotifier {
       }
       _cart[existingIndex].quantity++;
       if (note != null && note.trim().isNotEmpty) {
-        _cart[existingIndex].note = note.trim();
+        _cart[existingIndex].note = CartItem.composeNote(variant, note);
       }
     } else {
       _cart.add(
         CartItem(
-          product: product,
+          product: product.copyWith(sellPrice: product.sellPrice + (CartItem.variantPrices[variant] ?? 0)),
           quantity: 1,
-          note: (note != null && note.trim().isNotEmpty) ? note.trim() : null,
+          note: CartItem.composeNote(variant, note),
         ),
       );
     }
@@ -750,17 +765,19 @@ class PosProvider extends ChangeNotifier {
     return true;
   }
 
+  static const _anyVariant = Object();
+
   /// Adjusts cart item quantity by [delta]. Returns false if capped by stock.
-  bool updateQuantity(String productId, int delta) {
+  bool updateQuantity(String productId, int delta, {Object? variant = _anyVariant}) {
     if (!isAuthenticated || _checkoutInProgress || _savingBill) return false;
-    final index = _cart.indexWhere((item) => item.product.id == productId);
+    final index = _cart.indexWhere((item) => item.product.id == productId && (identical(variant, _anyVariant) || item.drinkVariant == variant));
     if (index == -1) return false;
 
     final liveProduct = _products.firstWhere(
       (p) => p.id == productId,
       orElse: () => _cart[index].product,
     );
-    _cart[index].product = liveProduct;
+    _cart[index].product = liveProduct.copyWith(sellPrice: liveProduct.sellPrice + (CartItem.variantPrices[_cart[index].drinkVariant] ?? 0));
 
     final newQty = _cart[index].quantity + delta;
     if (newQty <= 0) {
@@ -770,7 +787,8 @@ class PosProvider extends ChangeNotifier {
       return true;
     }
 
-    if (newQty > liveProduct.stock) {
+    final otherQuantity = _cart.where((item) => item.product.id == productId).fold<int>(0, (sum, item) => sum + item.quantity) - _cart[index].quantity;
+    if (newQty + otherQuantity > liveProduct.stock) {
       return false;
     }
 
@@ -779,14 +797,33 @@ class PosProvider extends ChangeNotifier {
     return true;
   }
 
-  void updateItemNote(String productId, String? note) {
+  bool setDrinkVariant(String productId, String? currentVariant, String variant) {
+    if (!isAuthenticated || _checkoutInProgress || _savingBill || !CartItem.variantPrices.containsKey(variant)) return false;
+    final index = _cart.indexWhere((item) => item.product.id == productId && item.drinkVariant == currentVariant);
+    if (index < 0 || !_cart[index].product.isDrink) return false;
+    final item = _cart[index];
+    if (currentVariant == variant) return true;
+    final target = _cart.indexWhere((other) => other.product.id == productId && other.drinkVariant == variant);
+    if (target >= 0 && _cart[target].customerNote != item.customerNote) return false;
+    final live = _products.where((p) => p.id == productId).firstOrNull;
+    if (live == null) return false;
+    if (target >= 0) {
+      _cart[target].quantity += item.quantity;
+      _cart.removeAt(index);
+    } else {
+      item.note = CartItem.composeNote(variant, item.customerNote);
+      item.product = live.copyWith(sellPrice: live.sellPrice + CartItem.variantPrices[variant]!);
+    }
+    notifyListeners();
+    return true;
+  }
+
+  void updateItemNote(String productId, String? note, {Object? variant = _anyVariant}) {
     if (_checkoutInProgress || _savingBill) return;
-    final index = _cart.indexWhere((item) => item.product.id == productId);
+    final index = _cart.indexWhere((item) => item.product.id == productId && (identical(variant, _anyVariant) || item.drinkVariant == variant));
     if (index == -1) return;
     final trimmed = note?.trim();
-    _cart[index].note = (trimmed != null && trimmed.isNotEmpty)
-        ? trimmed
-        : null;
+    _cart[index].note = CartItem.composeNote(_cart[index].drinkVariant, trimmed);
     notifyListeners();
   }
 
@@ -847,13 +884,16 @@ class PosProvider extends ChangeNotifier {
     if (!isAuthenticated) throw StateError('Silakan masuk terlebih dahulu.');
     if (_cart.isEmpty) throw StateError('Pesanan masih kosong.');
     if (!['Cash', 'QRIS'].contains(paymentMethod)) throw ArgumentError('Metode pembayaran tidak valid.');
+    final quantities = <String, int>{};
     for (final item in _cart) {
       final live = _products.where((p) => p.id == item.product.id).firstOrNull;
-      if (live == null || !live.isAvailable || item.quantity < 1 || item.quantity > live.stock ||
+      final total = (quantities[item.product.id] ?? 0) + item.quantity;
+      if (live == null || !live.isAvailable || item.quantity < 1 || total > live.stock ||
           !live.sellPrice.isFinite || live.sellPrice < 0 || !live.baseCost.isFinite || live.baseCost < 0) {
         throw StateError('Produk/stok berubah. Periksa kembali pesanan.');
       }
-      item.product = live;
+      quantities[item.product.id] = total;
+      item.product = live.copyWith(sellPrice: live.sellPrice + (CartItem.variantPrices[item.drinkVariant] ?? 0));
     }
     if (!amountPaid.isFinite || amountPaid < totalCartAmount) {
       throw ArgumentError('Nominal pembayaran tidak mencukupi atau tidak valid.');
@@ -931,6 +971,25 @@ class PosProvider extends ChangeNotifier {
     _transactions = _db.getTransactions();
     notifyListeners();
     return ok;
+  }
+
+  Future<TransactionRecord> correctTransaction({
+    required String transactionId,
+    required int expectedRevision,
+    required List<CartItem> items,
+    required double amountPaid,
+    required String reason,
+  }) async {
+    _requirePermission(true);
+    final saved = await _db.correctTransaction(
+      transactionId: transactionId, expectedRevision: expectedRevision,
+      items: items, amountPaid: amountPaid, reason: reason,
+    );
+    _products = _db.getProducts();
+    _transactions = _db.getTransactions();
+    _reconcileCartWithCatalog();
+    notifyListeners();
+    return saved;
   }
 
   // Inventory & Product Management

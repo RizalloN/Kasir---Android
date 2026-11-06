@@ -39,6 +39,7 @@ class _EditProductDialogState extends State<EditProductDialog> {
 
   String? _imageUrl;
   late bool _isAvailable;
+  bool? _drinkOverride;
   String? _validationError;
   bool _showCustomUrlInput = false;
   final ImagePicker _picker = ImagePicker();
@@ -66,6 +67,7 @@ class _EditProductDialogState extends State<EditProductDialog> {
       text: (p?.imageUrl?.startsWith('http') ?? false) ? p!.imageUrl : '',
     );
     _isAvailable = p?.isAvailable ?? true;
+    _drinkOverride = p?.drinkOverride;
   }
 
   @override
@@ -171,6 +173,7 @@ class _EditProductDialogState extends State<EditProductDialog> {
       imageUrl: _imageUrl?.trim().isNotEmpty == true ? _imageUrl!.trim() : null,
       barcode: resolvedBarcode,
       isAvailable: _isAvailable,
+      drinkOverride: _drinkOverride,
       updatedAt: DateTime.now(),
     );
 
@@ -601,8 +604,9 @@ class _EditProductDialogState extends State<EditProductDialog> {
                             ],
                           ),
                           const SizedBox(height: 6),
-                          Row(
-                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          Wrap(
+                            spacing: 8,
+                            runSpacing: 4,
                             children: [
                               if (_imageUrl != null && _imageUrl!.isNotEmpty)
                                 InkWell(
@@ -878,6 +882,13 @@ class _EditProductDialogState extends State<EditProductDialog> {
               ),
               const SizedBox(height: 12),
 
+              SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                value: !isHiburanCat && (_drinkOverride ?? Product.categoryIsDrink(_categoryController.text)),
+                title: const Text('Menu minuman', style: TextStyle(fontSize: 13, fontWeight: FontWeight.w700)),
+                subtitle: const Text('Aktifkan pilihan Panas, ES, dan Jumbo.', style: TextStyle(fontSize: 11.5)),
+                onChanged: isHiburanCat ? null : (value) => setState(() => _drinkOverride = value),
+              ),
               SwitchListTile(
                 contentPadding: EdgeInsets.zero,
                 value: _isAvailable,

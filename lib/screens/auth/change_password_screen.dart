@@ -41,7 +41,7 @@ class _ChangePasswordScreenState extends State<ChangePasswordScreen> {
                           crossAxisAlignment: CrossAxisAlignment.stretch,
                           children: [
                             const Text(
-                                'Gunakan password pribadi yang berbeda dari password bawaan. Minimal 12 karakter.'),
+                                'Gunakan password pribadi yang aman. Minimal 6 karakter.'),
                             const SizedBox(height: 20),
                             TextField(
                                 controller: _old,
@@ -79,10 +79,10 @@ class _ChangePasswordScreenState extends State<ChangePasswordScreen> {
                                               'Konfirmasi password tidak sama.');
                                           return;
                                         }
-                                        if (_new.text.length < 12 ||
+                                        if (_new.text.length < 6 ||
                                             _new.text.length > 128) {
                                           setState(() => _error =
-                                              'Password harus 12–128 karakter.');
+                                              'Password harus minimal 6 karakter.');
                                           return;
                                         }
                                         setState(() {

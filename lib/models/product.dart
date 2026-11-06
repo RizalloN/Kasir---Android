@@ -13,6 +13,7 @@ class Product {
   final bool isAvailable;
   final DateTime? updatedAt;
   final bool isSynced;
+  final bool? drinkOverride;
 
   const Product({
     required this.id,
@@ -27,7 +28,15 @@ class Product {
     this.isAvailable = true,
     this.updatedAt,
     this.isSynced = true,
+    this.drinkOverride,
   });
+
+  static bool categoryIsDrink(String category) {
+    final normalized = category.trim().toLowerCase();
+    return normalized == 'coffee' || normalized == 'non-coffee';
+  }
+
+  bool get isDrink => !isEntertainment && (drinkOverride ?? categoryIsDrink(category));
 
   double get profitMargin => sellPrice - baseCost;
 
@@ -68,6 +77,7 @@ class Product {
     bool? isAvailable,
     DateTime? updatedAt,
     bool? isSynced,
+    Object? drinkOverride = _unset,
   }) {
     return Product(
       id: id ?? this.id,
@@ -82,6 +92,7 @@ class Product {
       isAvailable: isAvailable ?? this.isAvailable,
       updatedAt: updatedAt ?? this.updatedAt,
       isSynced: isSynced ?? this.isSynced,
+      drinkOverride: identical(drinkOverride, _unset) ? this.drinkOverride : drinkOverride as bool?,
     );
   }
 
@@ -99,6 +110,7 @@ class Product {
       'isAvailable': isAvailable ? 1 : 0,
       'updatedAt': updatedAt?.toIso8601String(),
       'isSynced': isSynced ? 1 : 0,
+      if (drinkOverride != null) 'isDrink': drinkOverride! ? 1 : 0,
     };
   }
 
@@ -137,6 +149,7 @@ class Product {
           ? DateTime.tryParse(map['updatedAt'].toString())
           : null,
       isSynced: synced,
+      drinkOverride: map['isDrink'] == null ? null : (map['isDrink'] == true || map['isDrink'] == 1),
     );
   }
 }

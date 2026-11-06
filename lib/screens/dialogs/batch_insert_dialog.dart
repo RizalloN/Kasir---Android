@@ -91,6 +91,7 @@ class _BatchInsertDialogState extends State<BatchInsertDialog> {
                   id: row.id,
                   name: row.name.text.trim(),
                   category: row.category,
+                  drinkOverride: row.drinkOverride,
                   sellPrice: double.parse(row.price.text),
                   baseCost: double.parse(row.cost.text),
                   stock: int.parse(row.stock.text),
@@ -257,7 +258,17 @@ class _BatchInsertDialogState extends State<BatchInsertDialog> {
               decoration:
                   const InputDecoration(labelText: 'Catatan (opsional)'),
             )
-          else
+          else ...[
+            Material(
+              color: Colors.transparent,
+              child: SwitchListTile.adaptive(
+                contentPadding: EdgeInsets.zero,
+                title: const Text('Menu minuman'),
+                subtitle: const Text('Pilihan Panas, ES, dan Jumbo'),
+                value: row.category.toLowerCase() != 'hiburan' && (row.drinkOverride ?? Product.categoryIsDrink(row.category)),
+                onChanged: row.category.toLowerCase() == 'hiburan' ? null : (value) => setState(() => row.drinkOverride = value),
+              ),
+            ),
             Material(
               color: Colors.transparent,
               child: SwitchListTile.adaptive(
@@ -267,6 +278,7 @@ class _BatchInsertDialogState extends State<BatchInsertDialog> {
                 onChanged: (value) => setState(() => row.available = value),
               ),
             ),
+          ],
         ],
       ),
     );
@@ -378,6 +390,7 @@ class _BatchRow {
   final notes = TextEditingController();
   DateTime date = DateTime.now();
   bool available = true;
+  bool? drinkOverride;
 
   _BatchRow({required this.id, required this.category}) {
     if (category.toLowerCase() == 'hiburan') {

@@ -96,7 +96,7 @@ class UserProfile {
   }
 
   Future<UserProfile> withSecurePassword(String password) async {
-    if (password.length < 12 || password.length > 128) throw ArgumentError('Password harus 12–128 karakter.');
+    if (password.length < 6 || password.length > 128) throw ArgumentError('Password harus minimal 6 karakter.');
     final newSalt = generateSalt();
     final hash = await compute(_derivePassword, [password, newSalt]);
     return copyWith(passwordHash: 'pbkdf2-sha256:600000:$hash', salt: newSalt, requiresPasswordChange: false);
@@ -109,6 +109,7 @@ class UserProfile {
     return copyWith(
       salt: newSalt,
       passwordHash: newHash,
+      requiresPasswordChange: false,
     );
   }
 

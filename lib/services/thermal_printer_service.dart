@@ -329,9 +329,12 @@ class ThermalPrinterService {
         ]);
 
         // Note if present
-        if (item.note != null && item.note!.trim().isNotEmpty) {
+        if (item.drinkVariant != null) {
+          bytes += generator.text('  * Varian: ${item.drinkVariant}', styles: const PosStyles(fontType: PosFontType.fontB));
+        }
+        if (item.customerNote != null) {
           bytes += generator.text(
-            '  * Catatan: ${item.note!.trim()}',
+            '  * Catatan: ${item.customerNote}',
             styles: const PosStyles(fontType: PosFontType.fontB),
           );
         }

@@ -16,6 +16,7 @@ import 'dialogs/low_stock_alert_dialog.dart';
 import '../services/app_release_service.dart';
 import 'dialogs/app_update_dialog.dart';
 import 'dialogs/open_bills_dialog.dart';
+import 'dialogs/transaction_history_dialog.dart';
 import 'auth/change_password_screen.dart';
 
 class MainWrapperScreen extends StatefulWidget {
@@ -32,7 +33,7 @@ class _MainWrapperScreenState extends State<MainWrapperScreen> {
   Widget build(BuildContext context) {
     final pos = context.watch<PosProvider>();
     final releases = context.watch<AppReleaseService>();
-    final compact = MediaQuery.sizeOf(context).width < 600;
+    final compact = MediaQuery.sizeOf(context).width < 680;
 
     if (pos.initializationError != null) {
       return Scaffold(body: SafeArea(child: Center(child: Padding(padding: const EdgeInsets.all(24), child: Text(pos.initializationError!)))));
@@ -103,6 +104,8 @@ class _MainWrapperScreenState extends State<MainWrapperScreen> {
                   switch (action) {
                     case 'bills':
                       showDialog(context: context, builder: (_) => OpenBillsDialog(onResumed: () => setState(() => _ownerPosMode = true)));
+                    case 'history':
+                      showDialog(context: context, builder: (_) => const TransactionHistoryDialog());
                     case 'stock':
                       showDialog(context: context, builder: (_) => const LowStockAlertDialog());
                     case 'printer':
@@ -117,7 +120,8 @@ class _MainWrapperScreenState extends State<MainWrapperScreen> {
                   }
                 },
                 itemBuilder: (_) => [
-                  const PopupMenuItem(value: 'bills', child: Text('Tagihan Tersimpan')),
+                  const PopupMenuItem(value: 'bills', child: Text('Riwayat Pesanan Belum Dibayar')),
+                  const PopupMenuItem(value: 'history', child: Text('Riwayat Transaksi')),
                   if (pos.currentRole.canEditProducts)
                     const PopupMenuItem(value: 'stock', child: Text('Peringatan Stok')),
                   if (releases.enabled('thermal_printer'))
@@ -130,7 +134,10 @@ class _MainWrapperScreenState extends State<MainWrapperScreen> {
                 ],
               ),
             if (!compact)
-              IconButton(tooltip: 'Tagihan Tersimpan', icon: Badge(isLabelVisible: pos.openBills.isNotEmpty, label: Text('${pos.openBills.length}'), child: const Icon(Icons.receipt_long_outlined)),
+              IconButton(tooltip: 'Riwayat Transaksi', icon: const Icon(Icons.history_rounded),
+                onPressed: () => showDialog(context: context, builder: (_) => const TransactionHistoryDialog())),
+            if (!compact)
+              IconButton(tooltip: 'Riwayat Pesanan Belum Dibayar', icon: Badge(isLabelVisible: pos.openBills.isNotEmpty, label: Text('${pos.openBills.length}'), child: const Icon(Icons.receipt_long_outlined)),
                 onPressed: () => showDialog(context: context, builder: (_) => OpenBillsDialog(onResumed: () => setState(() => _ownerPosMode = true)))),
             if (!compact)
               IconButton(

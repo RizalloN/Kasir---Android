@@ -199,10 +199,18 @@ class UserProfileModal extends StatelessWidget {
               const SizedBox(height: 18),
 
               // Owner User Management Shortcut
-              OutlinedButton.icon(onPressed: () {
-                Navigator.pop(context);
-                Navigator.push(context, MaterialPageRoute(builder: (_) => const ChangePasswordScreen()));
-              }, icon: const Icon(Icons.password), label: const Text('Ganti Password Saya')),
+              SizedBox(
+                width: double.infinity,
+                child: OutlinedButton.icon(
+                  onPressed: () {
+                    Navigator.pop(context);
+                    Navigator.push(context, MaterialPageRoute(builder: (_) => const ChangePasswordScreen()));
+                  },
+                  icon: const Icon(Icons.password, size: 18),
+                  label: const Text('Ganti Password Saya'),
+                ),
+              ),
+              const SizedBox(height: 10),
               if (role.canManageUsers) ...[
                 SizedBox(
                   width: double.infinity,

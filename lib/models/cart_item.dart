@@ -2,6 +2,8 @@ import 'product.dart';
 
 class CartItem {
   static const Object _unset = Object();
+  static const variantPrices = <String, double>{'Panas': 0, 'ES': 1000, 'Jumbo': 3000};
+  static final _variantPattern = RegExp(r'^\[KAFE_VARIAN_v1:(Panas|ES|Jumbo)\](?:\n|$)');
 
   Product product;
   int quantity;
@@ -16,6 +18,19 @@ class CartItem {
   double get subtotal => product.sellPrice * quantity;
   double get subtotalCost => product.baseCost * quantity;
   double get subtotalProfit => subtotal - subtotalCost;
+
+  String? get drinkVariant => _variantPattern.firstMatch(note ?? '')?.group(1);
+  String? get customerNote {
+    final value = (note ?? '').replaceFirst(_variantPattern, '').trim();
+    return value.isEmpty ? null : value;
+  }
+
+  static String? composeNote(String? variant, String? customerNote) {
+    final clean = customerNote?.trim() ?? '';
+    if (variant == null) return clean.isEmpty ? null : clean;
+    if (!variantPrices.containsKey(variant)) throw ArgumentError('Varian minuman tidak valid.');
+    return '[KAFE_VARIAN_v1:$variant]${clean.isEmpty ? '' : '\n$clean'}';
+  }
 
   CartItem copyWith({
     Product? product,

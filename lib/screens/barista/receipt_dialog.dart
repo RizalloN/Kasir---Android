@@ -1,4 +1,5 @@
 import '../../widgets/access_denied.dart';
+import '../dialogs/transaction_history_dialog.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import '../../models/transaction.dart';
@@ -273,9 +274,11 @@ class _ReceiptDialogState extends State<ReceiptDialog> {
                                         color: AppTheme.textMain,
                                       ),
                                     ),
-                                    if (item.note != null && item.note!.isNotEmpty)
+                                    if (item.drinkVariant != null)
+                                      Text('Varian: ${item.drinkVariant}', style: const TextStyle(fontSize: 11, color: AppTheme.accentAmber)),
+                                    if (item.customerNote != null)
                                       Text(
-                                        'Catatan: ${item.note}',
+                                        'Catatan: ${item.customerNote}',
                                         style: const TextStyle(
                                           fontSize: 11,
                                           fontStyle: FontStyle.italic,
@@ -406,6 +409,24 @@ class _ReceiptDialogState extends State<ReceiptDialog> {
                         ),
                       ],
                     ),
+                    if (allowVoid && !isVoided) ...[
+                      const SizedBox(height: 8),
+                      SizedBox(
+                        width: double.infinity,
+                        child: OutlinedButton.icon(
+                          onPressed: () async {
+                            final corrected = await showDialog<bool>(
+                              context: context,
+                              barrierDismissible: false,
+                              builder: (_) => CorrectTransactionDialog(transaction: transaction),
+                            );
+                            if (corrected == true && context.mounted) Navigator.of(context).pop();
+                          },
+                          icon: const Icon(Icons.edit_outlined, size: 16),
+                          label: const Text('Koreksi Item Transaksi'),
+                        ),
+                      ),
+                    ],
                     if (canVoidNow) ...[
                       const SizedBox(height: 8),
                       SizedBox(

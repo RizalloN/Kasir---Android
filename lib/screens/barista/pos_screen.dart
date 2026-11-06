@@ -28,7 +28,7 @@ class _PosScreenState extends State<PosScreen> {
     super.dispose();
   }
 
-  void _handleProductTap(BuildContext context, PosProvider pos, Product product) {
+  Future<void> _handleProductTap(BuildContext context, PosProvider pos, Product product) async {
     if (!product.isAvailable) {
       AppTheme.showToast(
         context,
@@ -46,7 +46,27 @@ class _PosScreenState extends State<PosScreen> {
       return;
     }
 
-    final added = pos.addToCart(product);
+    String? variant;
+    if (product.isDrink) {
+      variant = await showDialog<String>(
+        context: context,
+        builder: (dialogContext) => AlertDialog(
+          title: Text('Pilih varian ${product.name}'),
+          content: SingleChildScrollView(child: Column(mainAxisSize: MainAxisSize.min, children: [
+            for (final choice in const {'Panas': 0, 'ES': 1000, 'Jumbo': 3000}.entries)
+              ListTile(
+                title: Text(choice.key),
+                subtitle: Text(choice.value == 0 ? 'Harga asli' : '+ ${CurrencyFormatter.format(choice.value)}'),
+                trailing: Text(CurrencyFormatter.format(product.sellPrice + choice.value)),
+                onTap: () => Navigator.of(dialogContext).pop(choice.key),
+              ),
+          ])),
+          actions: [TextButton(onPressed: () => Navigator.of(dialogContext).pop(), child: const Text('Batal'))],
+        ),
+      );
+      if (variant == null || !context.mounted) return;
+    }
+    final added = pos.addToCart(product, variant: variant);
     if (!added) {
       AppTheme.showToast(
         context,
@@ -600,8 +620,7 @@ class _PosScreenState extends State<PosScreen> {
   }
 
   Widget _buildProductCard(BuildContext context, Product product, PosProvider pos) {
-    final cartItemIndex = pos.cart.indexWhere((item) => item.product.id == product.id);
-    final inCartQty = cartItemIndex != -1 ? pos.cart[cartItemIndex].quantity : 0;
+    final inCartQty = pos.cart.where((item) => item.product.id == product.id).fold<int>(0, (sum, item) => sum + item.quantity);
     final isDisabled = product.isOutOfStock || !product.isAvailable;
     final canManage = pos.currentRole.canEditProducts;
 
@@ -802,7 +821,13 @@ class _PosScreenState extends State<PosScreen> {
                                   mainAxisSize: MainAxisSize.min,
                                   children: [
                                     InkWell(
-                                      onTap: () => pos.updateQuantity(product.id, -1),
+                                      onTap: () {
+                                        if (pos.cart.where((item) => item.product.id == product.id).length > 1) {
+                                          AppTheme.showToast(context, message: 'Kurangi varian yang diinginkan pada rincian pesanan.', isWarning: true);
+                                          return;
+                                        }
+                                        pos.updateQuantity(product.id, -1);
+                                      },
                                       borderRadius: BorderRadius.circular(8),
                                       child: const Padding(
                                         padding: EdgeInsets.symmetric(
@@ -827,6 +852,10 @@ class _PosScreenState extends State<PosScreen> {
                                     ),
                                     InkWell(
                                       onTap: () {
+                                        if (product.isDrink) {
+                                          _handleProductTap(context, pos, product);
+                                          return;
+                                        }
                                         final ok = pos.updateQuantity(product.id, 1);
                                         if (!ok) {
                                           AppTheme.showToast(

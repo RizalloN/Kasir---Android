@@ -11,12 +11,12 @@ class OpenBillsDialog extends StatelessWidget {
   Widget build(BuildContext context) {
     final pos = context.watch<PosProvider>();
     return AlertDialog(
-      title: const Text('Tagihan Tersimpan'),
+      title: const Text('Riwayat Pesanan Belum Dibayar'),
       content: SizedBox(
           width: 500,
           height: 420,
           child: pos.openBills.isEmpty
-              ? const Center(child: Text('Belum ada tagihan tersimpan.'))
+              ? const Center(child: Text('Belum ada pesanan tersimpan. Simpan pesanan dari keranjang agar dapat diperbaiki sebelum pembayaran.'))
               : ListView.separated(
                   itemCount: pos.openBills.length,
                   separatorBuilder: (_, __) => const Divider(),
@@ -25,7 +25,7 @@ class OpenBillsDialog extends StatelessWidget {
                     return ListTile(
                       title: Text(bill.customerName),
                       subtitle: Text(
-                          '${bill.items.length} menu · ${CurrencyFormatter.format(bill.totalAmount)}\n${bill.orderType}'),
+                          '${bill.items.length} menu · ${CurrencyFormatter.format(bill.totalAmount)}\n${bill.orderType} · Ketuk untuk memperbaiki'),
                       isThreeLine: true,
                       trailing: IconButton(
                           tooltip: 'Hapus tagihan',

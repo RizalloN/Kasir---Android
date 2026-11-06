@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'cart_item.dart';
 
 class TransactionRecord {
@@ -21,8 +22,12 @@ class TransactionRecord {
   final DateTime createdAt;
   final bool isSynced;
   final bool isVoided;
+  final int revision;
+  final List<Map<String, dynamic>> _corrections;
+  List<Map<String, dynamic>> get corrections => _corrections.map((entry) =>
+      Map<String, dynamic>.from(jsonDecode(jsonEncode(entry)) as Map)).toList(growable: false);
 
-  const TransactionRecord({
+  TransactionRecord({
     required this.id,
     required this.invoiceNumber,
     required this.items,
@@ -43,7 +48,11 @@ class TransactionRecord {
     required this.createdAt,
     this.isSynced = false,
     this.isVoided = false,
-  }) : subtotalAmount = subtotalAmount ?? (totalAmount + discountAmount);
+    this.revision = 0,
+    List<Map<String, dynamic>> corrections = const [],
+  }) : _corrections = corrections.map((entry) =>
+          Map<String, dynamic>.from(jsonDecode(jsonEncode(entry)) as Map)).toList(growable: false),
+       subtotalAmount = subtotalAmount ?? (totalAmount + discountAmount);
 
   int get totalQuantity => items.fold(0, (sum, item) => sum + item.quantity);
 
@@ -68,6 +77,8 @@ class TransactionRecord {
     DateTime? createdAt,
     bool? isSynced,
     bool? isVoided,
+    int? revision,
+    List<Map<String, dynamic>>? corrections,
   }) {
     return TransactionRecord(
       id: id ?? this.id,
@@ -90,6 +101,8 @@ class TransactionRecord {
       createdAt: createdAt ?? this.createdAt,
       isSynced: isSynced ?? this.isSynced,
       isVoided: isVoided ?? this.isVoided,
+      revision: revision ?? this.revision,
+      corrections: corrections ?? this.corrections,
     );
   }
 
@@ -115,6 +128,8 @@ class TransactionRecord {
       'createdAt': createdAt.toIso8601String(),
       'isSynced': isSynced ? 1 : 0,
       'isVoided': isVoided ? 1 : 0,
+      if (revision > 0) 'revision': revision,
+      if (corrections.isNotEmpty) 'corrections': corrections,
     };
   }
 
@@ -150,6 +165,9 @@ class TransactionRecord {
           : DateTime.now(),
       isSynced: map['isSynced'] == 1 || map['isSynced'] == true,
       isVoided: map['isVoided'] == 1 || map['isVoided'] == true,
+      revision: (map['revision'] as num?)?.toInt() ?? 0,
+      corrections: (map['corrections'] as List<dynamic>? ?? const [])
+          .map((entry) => Map<String, dynamic>.from(entry as Map)).toList(),
     );
   }
 }

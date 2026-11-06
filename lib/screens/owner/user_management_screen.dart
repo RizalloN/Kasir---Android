@@ -332,10 +332,10 @@ class _UserManagementScreenState extends State<UserManagementScreen> {
                                 });
                                 return;
                               }
-                              if ((!isEditing || plainPass.isNotEmpty) && (plainPass.length < 12 || plainPass.length > 128)) {
+                              if ((!isEditing || plainPass.isNotEmpty) && (plainPass.length < 6 || plainPass.length > 128)) {
                                 setDialogState(() {
                                   dialogError =
-                                      'Password harus 12?128 karakter.';
+                                      'Password harus minimal 6 karakter.';
                                 });
                                 return;
                               }
