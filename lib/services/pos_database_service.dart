@@ -424,10 +424,6 @@ class PosDatabaseService {
                 await _persistProducts();
                 _notifyProducts();
 
-                if (_isOnline && !snapshot.metadata.isFromCache &&
-                    !snapshot.metadata.hasPendingWrites) {
-                  unawaited(_syncPendingOfflineProducts());
-                }
               } else if (_products.isNotEmpty) {
                 try {
                   for (int i = 0; i < _products.length; i++) {
@@ -454,6 +450,7 @@ class PosDatabaseService {
       _firestoreTransactionsSub = _firestore!
           .collection('transactions')
           .orderBy('createdAt', descending: true)
+          .limit(100)
           .snapshots(includeMetadataChanges: true)
           .listen(
             (snapshot) async {
@@ -485,11 +482,12 @@ class PosDatabaseService {
             },
           );
 
-      // Operational Expenses Sync
+      // Operational Expenses Sync (Limited to 100 to conserve Firestore read quota)
       _firestoreExpensesSub?.cancel();
       _firestoreExpensesSub = _firestore!
           .collection('operational_expenses')
           .orderBy('createdAt', descending: true)
+          .limit(100)
           .snapshots()
           .listen(
             (snapshot) async {
@@ -513,8 +511,6 @@ class PosDatabaseService {
                 _sortOperationalExpenses();
                 await _persistOperationalExpenses();
                 _notifyOperationalExpenses();
-              } else if (_operationalExpenses.isNotEmpty && _isOnline) {
-                unawaited(_syncPendingOfflineExpenses());
               }
             },
             onError: (error) {
@@ -659,6 +655,8 @@ class PosDatabaseService {
     ).toList();
   }
 
+  bool _isSyncingPending = false;
+
   void setOnlineStatus(bool online) {
     _isOnline = online;
     if (_isOnline) {
@@ -667,9 +665,15 @@ class PosDatabaseService {
   }
 
   Future<void> _syncPendingOfflineData() async {
-    await _syncPendingOfflineProducts();
-    await _syncPendingOfflineTransactions();
-    await _syncPendingOfflineExpenses();
+    if (_isSyncingPending || _firestore == null || !_isOnline) return;
+    _isSyncingPending = true;
+    try {
+      await _syncPendingOfflineProducts();
+      await _syncPendingOfflineTransactions();
+      await _syncPendingOfflineExpenses();
+    } finally {
+      _isSyncingPending = false;
+    }
   }
 
   Future<void> _syncPendingOfflineProducts() async {
