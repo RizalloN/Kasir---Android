@@ -1,0 +1,76 @@
+# Miscellaneous
+*.class
+*.log
+*.pyc
+*.swp
+.DS_Store
+.atom/
+.build/
+.buildlog/
+.history
+.svn/
+.swiftpm/
+migrate_working_dir/
+Thumbs.db
+
+# IntelliJ / Android Studio / VS Code
+*.iml
+*.ipr
+*.iws
+.idea/
+.vscode/
+
+# Flutter / Dart / Pub
+**/doc/api/
+**/ios/Flutter/.last_build_id
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.pub-cache/
+.pub/
+/build/
+/coverage/
+
+# Android build & cache
+.gradle/
+**/.gradle/
+.kotlin/
+**/.kotlin/
+/android/app/debug
+/android/app/profile
+/android/app/release
+/android/build/
+**/android/build/
+*.apk
+*.aab
+
+# Symbolication & Obfuscation
+app.*.symbols
+app.*.map.json
+
+# Widget Preview
+.widget_preview/
+
+# Sensitive Firebase / Google Services
+google-services.json
+**/android/app/google-services.json
+GoogleService-Info.plist
+
+# Local SDK & Properties
+local.properties
+**/local.properties
+android/local.properties
+
+# Keystore & Signing Keys
+*.jks
+*.keystore
+*.key
+key.properties
+**/android/key.properties
+
+# Environment & Secret files
+*.env
+*.env.*
+*.pem
+*.p12
+*.pfx
