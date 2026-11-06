@@ -14,7 +14,6 @@ class UserProfile {
   final bool isActive;
   final DateTime createdAt;
   final DateTime? lastLoginAt;
-  final bool requiresPasswordChange;
 
   const UserProfile({
     required this.id,
@@ -26,7 +25,6 @@ class UserProfile {
     this.isActive = true,
     required this.createdAt,
     this.lastLoginAt,
-    this.requiresPasswordChange = false,
   });
 
   /// Cryptographic salted SHA-256 password hash generator
@@ -99,7 +97,7 @@ class UserProfile {
     if (password.length < 6 || password.length > 128) throw ArgumentError('Password harus minimal 6 karakter.');
     final newSalt = generateSalt();
     final hash = await compute(_derivePassword, [password, newSalt]);
-    return copyWith(passwordHash: 'pbkdf2-sha256:600000:$hash', salt: newSalt, requiresPasswordChange: false);
+    return copyWith(passwordHash: 'pbkdf2-sha256:600000:$hash', salt: newSalt);
   }
 
   /// Returns a copy with freshly salted SHA-256 password credentials
@@ -109,7 +107,6 @@ class UserProfile {
     return copyWith(
       salt: newSalt,
       passwordHash: newHash,
-      requiresPasswordChange: false,
     );
   }
 
@@ -123,7 +120,6 @@ class UserProfile {
     bool? isActive,
     DateTime? createdAt,
     DateTime? lastLoginAt,
-    bool? requiresPasswordChange,
   }) {
     return UserProfile(
       id: id ?? this.id,
@@ -135,7 +131,6 @@ class UserProfile {
       isActive: isActive ?? this.isActive,
       createdAt: createdAt ?? this.createdAt,
       lastLoginAt: lastLoginAt ?? this.lastLoginAt,
-      requiresPasswordChange: requiresPasswordChange ?? this.requiresPasswordChange,
     );
   }
 
@@ -150,7 +145,6 @@ class UserProfile {
       'isActive': isActive,
       'createdAt': createdAt.toIso8601String(),
       'lastLoginAt': lastLoginAt?.toIso8601String(),
-      'requiresPasswordChange': requiresPasswordChange,
     };
   }
 
@@ -166,7 +160,6 @@ class UserProfile {
       passwordHash: map['passwordHash'] as String? ?? '',
       salt: map['salt'] as String? ?? '',
       isActive: map['isActive'] as bool? ?? true,
-      requiresPasswordChange: map['requiresPasswordChange'] as bool? ?? false,
       createdAt: map['createdAt'] != null
           ? DateTime.tryParse(map['createdAt'] as String) ?? DateTime.now()
           : DateTime.now(),

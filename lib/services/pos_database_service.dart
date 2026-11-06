@@ -18,7 +18,7 @@ class PosDatabaseService {
   UserProfile? get _actor => _users.where((u) => u.id == _sessionUserId && u.isActive).firstOrNull;
   void _requireAccess(bool Function(UserRole) check) {
     final actor = _actor;
-    if (actor == null || actor.requiresPasswordChange || !check(actor.role)) throw StateError('Akses ditolak.');
+    if (actor == null || !check(actor.role)) throw StateError('Akses ditolak.');
   }
   Future<UserProfile?> restoreSession() async {
     final prefs = await SecurePreferences.getInstance();
@@ -266,10 +266,6 @@ class PosDatabaseService {
       await _persistUsers();
     }
 
-    final hasResetV2 = prefs.getBool('warloc_v2_passwords_reset_20261106') ?? false;
-    if (!hasResetV2 && !_testMode) {
-      await resetDefaultPasswords();
-    }
 
     // 5. Load Categories (including Hiburan)
     final Set<String> loadedCategories = {
@@ -329,21 +325,21 @@ class PosDatabaseService {
         displayName: 'Kasir Warloc',
         role: UserRole.barista,
         plainPassword: 'sukses000',
-      ).copyWith(requiresPasswordChange: false),
+      ),
       UserProfile.create(
         id: 'u_admin_default',
         username: 'warloc.admin',
         displayName: 'Admin Warloc',
         role: UserRole.admin,
         plainPassword: 'sukses123',
-      ).copyWith(requiresPasswordChange: false),
+      ),
       UserProfile.create(
         id: 'u_owner_default',
         username: 'warloc.owner',
         displayName: 'Owner Warloc',
         role: UserRole.owner,
         plainPassword: 'sukses888',
-      ).copyWith(requiresPasswordChange: false),
+      ),
     ];
   }
 
@@ -364,58 +360,8 @@ class PosDatabaseService {
         _users.add(def);
       } else {
         final existing = _users[existingIndex];
-        if (!existing.isActive || existing.requiresPasswordChange) {
-          _users[existingIndex] = existing.copyWith(
-            isActive: true,
-            requiresPasswordChange: false,
-          );
-        }
-      }
-    }
-  }
-
-  Future<void> resetDefaultPasswords() async {
-    final defaults = _getDefaultUsers();
-    final legacyUsernames = {'user', 'admin', 'iggoys'};
-    _users.removeWhere((u) => legacyUsernames.contains(u.username.toLowerCase()));
-
-    for (final def in defaults) {
-      final idx = _users.indexWhere((u) =>
-          u.id == def.id || u.username.toLowerCase() == def.username.toLowerCase());
-      if (idx >= 0) {
-        _users[idx] = _users[idx].copyWith(
-          username: def.username,
-          displayName: def.displayName,
-          role: def.role,
-          passwordHash: def.passwordHash,
-          salt: def.salt,
-          isActive: true,
-          requiresPasswordChange: false,
-        );
-      } else {
-        _users.add(def);
-      }
-    }
-
-    final prefs = await SecurePreferences.getInstance();
-    await prefs.remove('login_failures');
-    await prefs.remove('login_locked_until');
-    await prefs.setBool('warloc_v2_passwords_reset_20261106', true);
-
-    await _persistUsers();
-    _notifyUsers();
-
-    if (_firestore != null && _isOnline) {
-      for (final def in defaults) {
-        final current = _users.firstWhere(
-            (u) => u.username.toLowerCase() == def.username.toLowerCase());
-        try {
-          await _firestore!
-              .collection('users')
-              .doc(current.id)
-              .set(current.toMap(), SetOptions(merge: true));
-        } catch (e) {
-          debugPrint('Error syncing reset user to Firestore: ');
+        if (!existing.isActive) {
+          _users[existingIndex] = existing.copyWith(isActive: true);
         }
       }
     }
@@ -1009,44 +955,9 @@ class PosDatabaseService {
       if (until > DateTime.now().millisecondsSinceEpoch) throw StateError('Terlalu banyak percobaan. Coba lagi dalam 30 detik.');
       
       final cleanUsername = username.trim().toLowerCase();
-      var user = _findUserByUsername(cleanUsername);
-      if (user == null) {
-        final def = _getDefaultUsers().where((d) => d.username.toLowerCase() == cleanUsername).firstOrNull;
-        if (def != null) {
-          _users.add(def);
-          user = def;
-          await _persistUsers();
-          _notifyUsers();
-        }
-      }
+      final user = _findUserByUsername(cleanUsername);
 
-      var verified = user != null && await user.verifyPasswordAsync(password);
-      if (!verified && user != null) {
-        const defaultCredentials = {
-          'warloc.kasir': 'sukses000',
-          'warloc.admin': 'sukses123',
-          'warloc.owner': 'sukses888',
-        };
-        if (defaultCredentials[user.username.toLowerCase()] == password) {
-          final updated = user.withUpdatedPassword(password).copyWith(
-            isActive: true,
-            requiresPasswordChange: false,
-          );
-          final idx = _users.indexWhere((u) => u.id == updated.id);
-          if (idx >= 0) {
-            _users[idx] = updated;
-            await _persistUsers();
-            _notifyUsers();
-            if (_firestore != null && _isOnline) {
-              unawaited(_syncSavedUser(updated));
-            }
-          }
-          user = updated;
-          verified = true;
-        }
-      }
-
-      if (user == null || !verified) {
+      if (user == null || !await user.verifyPasswordAsync(password)) {
         final failures = (prefs.getInt('login_failures') ?? 0) + 1;
         await prefs.setInt('login_failures', failures >= 5 ? 0 : failures);
         if (failures >= 5) await prefs.setInt('login_locked_until', DateTime.now().add(const Duration(seconds: 30)).millisecondsSinceEpoch);
@@ -1453,8 +1364,14 @@ class PosDatabaseService {
             final ref = firestore.collection('products').doc(entry.key);
             final snapshot = await transaction.get(ref);
             final data = snapshot.data();
-            if (data == null || Product.fromMap(data).stock != entry.value.stock) {
-              throw StateError('Stok berubah di perangkat lain. Sinkronkan dan coba lagi.');
+            final remoteProduct = data == null ? null : Product.fromMap(data);
+            final localProduct = entry.value;
+            if (remoteProduct == null || remoteProduct.stock != localProduct.stock ||
+                remoteProduct.sellPrice != localProduct.sellPrice || remoteProduct.baseCost != localProduct.baseCost ||
+                remoteProduct.isAvailable != localProduct.isAvailable || remoteProduct.isDrink != localProduct.isDrink ||
+                remoteProduct.isEntertainment != localProduct.isEntertainment ||
+                remoteProduct.minStockThreshold != localProduct.minStockThreshold) {
+              throw StateError('Stok atau menu berubah di perangkat lain. Sinkronkan dan coba lagi.');
             }
             refs[entry.key] = ref;
           }

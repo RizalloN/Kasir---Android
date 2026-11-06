@@ -242,10 +242,9 @@ class _CorrectTransactionDialogState extends State<CorrectTransactionDialog> {
       if (mounted) {
         setState(() {
           _saving = false;
-          _error = error
-              .toString()
-              .replaceFirst('Bad state: ', '')
-              .replaceFirst('Invalid argument(s): ', '');
+          _error = error is StateError || error is ArgumentError
+              ? error.toString().replaceFirst('Bad state: ', '').replaceFirst('Invalid argument(s): ', '')
+              : 'Koreksi belum dapat dipastikan. Periksa koneksi dan buka kembali riwayat sebelum mencoba lagi.';
         });
       }
     }

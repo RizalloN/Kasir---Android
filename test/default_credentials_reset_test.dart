@@ -15,7 +15,7 @@ void main() {
     SecurePreferences.resetForTesting();
   });
 
-  test('All 3 default accounts login with exact requested credentials and no password change required', () async {
+  test('All 3 default accounts login with exact requested credentials and roles', () async {
     final db = PosDatabaseService.instance;
     await db.resetForTesting();
 
@@ -31,7 +31,6 @@ void main() {
     expect(errKasir, isNull);
     expect(pos.isAuthenticated, isTrue);
     expect(pos.currentRole, UserRole.barista);
-    expect(pos.requiresPasswordChange, isFalse);
     await pos.logout();
 
     // 2. Admin
@@ -39,7 +38,6 @@ void main() {
     expect(errAdmin, isNull);
     expect(pos.isAuthenticated, isTrue);
     expect(pos.currentRole, UserRole.admin);
-    expect(pos.requiresPasswordChange, isFalse);
     await pos.logout();
 
     // 3. Owner
@@ -47,16 +45,15 @@ void main() {
     expect(errOwner, isNull);
     expect(pos.isAuthenticated, isTrue);
     expect(pos.currentRole, UserRole.owner);
-    expect(pos.requiresPasswordChange, isFalse);
     await pos.logout();
 
-    // Wrong password test
+    // Wrong password test (rejected without any self-healing)
     final errWrong = await pos.login('warloc.owner', 'salah_password');
     expect(errWrong, isNotNull);
     expect(pos.isAuthenticated, isFalse);
   });
 
-  test('resetDefaultPasswords restores default credentials even after alteration', () async {
+  test('Standard authentication rejects old password after intentional password update', () async {
     final db = PosDatabaseService.instance;
     await db.resetForTesting();
 
@@ -67,19 +64,21 @@ void main() {
       await Future<void>.delayed(const Duration(milliseconds: 5));
     }
 
-    // Alter owner password
+    // Login owner
     expect(await pos.login('warloc.owner', 'sukses888'), isNull);
     final user = pos.currentUser!;
-    final modified = await user.withSecurePassword('ChangedPassword123#');
+    final modified = await user.withSecurePassword('NewOwnerPass2026');
     await db.saveUser(modified);
     await pos.logout();
 
-    // Now sukses888 triggers auto-heal / self-reset or resetDefaultPasswords restores it
-    await pos.resetDefaultPasswords();
+    // Old default password should fail because self-healing is removed
+    final errOld = await pos.login('warloc.owner', 'sukses888');
+    expect(errOld, isNotNull);
+    expect(pos.isAuthenticated, isFalse);
 
-    expect(await pos.login('warloc.owner', 'sukses888'), isNull);
+    // New password should succeed
+    final errNew = await pos.login('warloc.owner', 'NewOwnerPass2026');
+    expect(errNew, isNull);
     expect(pos.isAuthenticated, isTrue);
-    expect(pos.currentRole, UserRole.owner);
-    expect(pos.requiresPasswordChange, isFalse);
   });
 }

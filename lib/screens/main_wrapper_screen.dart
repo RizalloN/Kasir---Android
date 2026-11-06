@@ -17,7 +17,6 @@ import '../services/app_release_service.dart';
 import 'dialogs/app_update_dialog.dart';
 import 'dialogs/open_bills_dialog.dart';
 import 'dialogs/transaction_history_dialog.dart';
-import 'auth/change_password_screen.dart';
 
 class MainWrapperScreen extends StatefulWidget {
   const MainWrapperScreen({super.key});
@@ -72,7 +71,6 @@ class _MainWrapperScreenState extends State<MainWrapperScreen> {
       );
     }
 
-    if (pos.requiresPasswordChange) return const ChangePasswordScreen();
 
     final isOwner = pos.currentRole == UserRole.owner;
     final roleColor = AppTheme.roleColor(pos.currentRole);

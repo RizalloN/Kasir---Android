@@ -293,6 +293,31 @@ void main() {
     expect(pos.products.firstWhere((p) => p.id == coffee.id).stock, 47);
   });
 
+  test(
+      'Existing item prices remain historical when the menu price or marker changes',
+      () async {
+    final pos = await fresh();
+    final tx = await sale(pos);
+    final coffee = pos.products.firstWhere((p) => p.id == 'w_1');
+    await pos.updateExistingProduct(
+        coffee.copyWith(sellPrice: 30000, drinkOverride: false));
+    final altered = tx.items.single.copyWith(
+      quantity: 1,
+      product: tx.items.single.product.copyWith(name: 'Nama palsu'),
+      note: CartItem.composeNote('ES', 'Catatan palsu'),
+    );
+    final saved = await pos.correctTransaction(
+        transactionId: tx.id,
+        expectedRevision: 0,
+        items: [altered],
+        amountPaid: 50000,
+        reason: 'Jumlah salah');
+    expect(saved.totalAmount, 23000);
+    expect(saved.items.single.product.name, tx.items.single.product.name);
+    expect(saved.items.single.customerNote, isNull);
+    expect(saved.items.single.drinkVariant, 'ES');
+  });
+
   for (final size in [const Size(320, 568), const Size(800, 360)]) {
     testWidgets('Correction remains usable at $size with large text',
         (tester) async {

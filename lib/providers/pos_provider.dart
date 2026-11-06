@@ -166,7 +166,7 @@ class PosProvider extends ChangeNotifier {
   Timer? _sessionTimer;
   DateTime? _sessionExpiresAt;
   bool _changingOwnPassword = false;
-  bool get requiresPasswordChange => _currentUser?.requiresPasswordChange ?? false;
+  bool get requiresPasswordChange => false;
   bool get isInitialized => _isInitialized;
 
   UserProfile? _currentUser;
@@ -191,7 +191,7 @@ class PosProvider extends ChangeNotifier {
       isAuthenticated && currentRole.canViewFinancialReports ? List.unmodifiable(_operationalExpenses) : const [];
 
   List<UserProfile> _users = [];
-  List<UserProfile> get users => isAuthenticated && !requiresPasswordChange && currentRole.canManageUsers ? List.unmodifiable(_users) : const [];
+  List<UserProfile> get users => isAuthenticated && currentRole.canManageUsers ? List.unmodifiable(_users) : const [];
 
   List<String> _categories = [];
   List<String> get categories => List.unmodifiable(_categories);
@@ -527,11 +527,6 @@ class PosProvider extends ChangeNotifier {
     return success;
   }
 
-  Future<void> resetDefaultPasswords() async {
-    await _db.resetDefaultPasswords();
-    _users = _db.getUsers();
-    notifyListeners();
-  }
 
   // Printer Preferences
   Future<void> setPrinterPaperWidth(int width) async {
@@ -1112,7 +1107,7 @@ class PosProvider extends ChangeNotifier {
   }
 
   void _requirePermission(bool permitted) {
-    if (!isAuthenticated || requiresPasswordChange || !permitted) throw StateError('Akses ditolak.');
+    if (!isAuthenticated || !permitted) throw StateError('Akses ditolak.');
   }
 
   void _validateProduct(Product product) {
