@@ -375,7 +375,7 @@ class PosDatabaseService {
       _firestoreProductsSub?.cancel();
       _firestoreProductsSub = _firestore!
           .collection('products')
-          .snapshots(includeMetadataChanges: true)
+          .snapshots()
           .listen(
             (snapshot) async {
               if (snapshot.docs.isNotEmpty) {
@@ -451,7 +451,7 @@ class PosDatabaseService {
           .collection('transactions')
           .orderBy('createdAt', descending: true)
           .limit(100)
-          .snapshots(includeMetadataChanges: true)
+          .snapshots()
           .listen(
             (snapshot) async {
               if (snapshot.docs.isNotEmpty) {
@@ -522,7 +522,7 @@ class PosDatabaseService {
       _firestoreUsersSub?.cancel();
       _firestoreUsersSub = _firestore!
           .collection('users')
-          .snapshots(includeMetadataChanges: true)
+          .snapshots()
           .listen(
             (snapshot) async {
               if (snapshot.docs.isNotEmpty) {
@@ -678,25 +678,26 @@ class PosDatabaseService {
 
   Future<void> _syncPendingOfflineProducts() async {
     if (_firestore == null) return;
-    bool hasChanges = false;
-    for (int i = 0; i < _products.length; i++) {
-      if (!_products[i].isSynced) {
-        try {
-          final syncedProd = _products[i].copyWith(isSynced: true);
-          await _firestore!
-              .collection('products')
-              .doc(syncedProd.id)
-              .set(syncedProd.toMap());
-          _products[i] = syncedProd;
-          hasChanges = true;
-        } catch (e) {
-          debugPrint('Failed to sync product ${_products[i].id}: $e');
+    final unsynced = _products.where((p) => !p.isSynced).toList();
+    if (unsynced.isEmpty) return;
+
+    try {
+      final batch = _firestore!.batch();
+      for (final p in unsynced) {
+        final synced = p.copyWith(isSynced: true);
+        batch.set(_firestore!.collection('products').doc(synced.id), synced.toMap(), SetOptions(merge: true));
+      }
+      await batch.commit();
+
+      for (int i = 0; i < _products.length; i++) {
+        if (!_products[i].isSynced) {
+          _products[i] = _products[i].copyWith(isSynced: true);
         }
       }
-    }
-    if (hasChanges) {
       await _persistProducts();
       _notifyProducts();
+    } catch (e) {
+      debugPrint('Batch sync products notice: $e');
     }
   }
 
@@ -738,27 +739,26 @@ class PosDatabaseService {
 
   Future<void> _syncPendingOfflineExpenses() async {
     if (_firestore == null) return;
-    bool hasChanges = false;
-    for (int i = 0; i < _operationalExpenses.length; i++) {
-      if (!_operationalExpenses[i].isSynced) {
-        try {
-          final syncedExp = _operationalExpenses[i].copyWith(isSynced: true);
-          await _firestore!
-              .collection('operational_expenses')
-              .doc(syncedExp.id)
-              .set(syncedExp.toMap());
-          _operationalExpenses[i] = syncedExp;
-          hasChanges = true;
-        } catch (e) {
-          debugPrint(
-            'Failed to sync operational expense ${_operationalExpenses[i].id}: $e',
-          );
+    final unsynced = _operationalExpenses.where((e) => !e.isSynced).toList();
+    if (unsynced.isEmpty) return;
+
+    try {
+      final batch = _firestore!.batch();
+      for (final exp in unsynced) {
+        final synced = exp.copyWith(isSynced: true);
+        batch.set(_firestore!.collection('operational_expenses').doc(synced.id), synced.toMap(), SetOptions(merge: true));
+      }
+      await batch.commit();
+
+      for (int i = 0; i < _operationalExpenses.length; i++) {
+        if (!_operationalExpenses[i].isSynced) {
+          _operationalExpenses[i] = _operationalExpenses[i].copyWith(isSynced: true);
         }
       }
-    }
-    if (hasChanges) {
       await _persistOperationalExpenses();
       _notifyOperationalExpenses();
+    } catch (e) {
+      debugPrint('Batch sync operational expenses notice: $e');
     }
   }
 
