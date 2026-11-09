@@ -32,11 +32,16 @@ class _ReceiptDialogState extends State<ReceiptDialog> {
   bool get allowVoid => widget.allowVoid;
 
   Future<void> _handlePrint(BuildContext context, PosProvider pos, int paperWidth) async {
+    if (_isPrinting) return;
     if (!(context.read<AppReleaseService?>()?.enabled('thermal_printer') ?? true)) {
       AppTheme.showToast(context, message: 'Fitur printer dinonaktifkan sementara.', isWarning: true);
       return;
     }
+    setState(() => _isPrinting = true);
+    await pos.checkPrinterConnection();
+    if (!mounted || !context.mounted) return;
     if (!pos.isPrinterConnected) {
+      setState(() => _isPrinting = false);
       showDialog(
         context: context,
         builder: (ctx) => AlertDialog(
@@ -77,7 +82,6 @@ class _ReceiptDialogState extends State<ReceiptDialog> {
       return;
     }
 
-    setState(() => _isPrinting = true);
     final res = await ThermalPrinterService.instance.printTransactionReceipt(
       transaction,
       paperWidth: paperWidth,
@@ -124,13 +128,19 @@ class _ReceiptDialogState extends State<ReceiptDialog> {
     if (confirm == true && context.mounted) {
       final ok = await pos.voidTransaction(transaction.id);
       if (context.mounted) {
-        Navigator.of(context).pop();
         if (ok) {
+          Navigator.of(context).pop();
           AppTheme.showToast(
             context,
             message:
                 'Transaksi ${transaction.invoiceNumber} dibatalkan & stok telah dikembalikan.',
             isWarning: true,
+          );
+        } else {
+          AppTheme.showToast(
+            context,
+            message: 'Transaksi tidak dapat dibatalkan. Periksa kembali riwayat transaksi.',
+            isError: true,
           );
         }
       }
@@ -227,7 +237,7 @@ class _ReceiptDialogState extends State<ReceiptDialog> {
                       ),
                       const SizedBox(height: 3),
                       const Text(
-                        'Coffee, Eatery & Entertainment\nJl. Nongkrong Warloc No. 1, Jakarta\nTelp: 0812-9988-7766',
+                        'Coffee, Eatery & Entertainment\nKedungmulyo, Kutorejo, Kab. Mojokerto',
                         textAlign: TextAlign.center,
                         style: TextStyle(
                           fontSize: 11,
@@ -368,80 +378,85 @@ class _ReceiptDialogState extends State<ReceiptDialog> {
               ),
 
               // Pinned Bottom Action Bar
-              Container(
-                padding: const EdgeInsets.all(14),
-                decoration: const BoxDecoration(
-                  color: AppTheme.surfaceLight,
-                  borderRadius: BorderRadius.only(
-                    bottomLeft: Radius.circular(18),
-                    bottomRight: Radius.circular(18),
-                  ),
-                  border: Border(
-                    top: BorderSide(color: AppTheme.borderSubtle, width: 1),
-                  ),
-                ),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Row(
+              ConstrainedBox(
+                constraints: BoxConstraints(maxHeight: MediaQuery.sizeOf(context).height * 0.42),
+                child: SingleChildScrollView(
+                  child: Container(
+                    padding: const EdgeInsets.all(14),
+                    decoration: const BoxDecoration(
+                      color: AppTheme.surfaceLight,
+                      borderRadius: BorderRadius.only(
+                        bottomLeft: Radius.circular(18),
+                        bottomRight: Radius.circular(18),
+                      ),
+                      border: Border(
+                        top: BorderSide(color: AppTheme.borderSubtle, width: 1),
+                      ),
+                    ),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
                       children: [
-                        Expanded(
-                          child: OutlinedButton.icon(
-                            onPressed: _isPrinting
-                                ? null
-                                : () => _handlePrint(context, pos, paperWidth),
-                            icon: _isPrinting
-                                ? const SizedBox(
-                                    width: 14,
-                                    height: 14,
-                                    child: CircularProgressIndicator(strokeWidth: 2),
-                                  )
-                                : const Icon(Icons.print_rounded, size: 17),
-                            label: Text('Cetak (${paperWidth}mm)'),
-                          ),
+                        Row(
+                          children: [
+                            Expanded(
+                              child: OutlinedButton.icon(
+                                onPressed: _isPrinting
+                                    ? null
+                                    : () => _handlePrint(context, pos, paperWidth),
+                                icon: _isPrinting
+                                    ? const SizedBox(
+                                        width: 14,
+                                        height: 14,
+                                        child: CircularProgressIndicator(strokeWidth: 2),
+                                      )
+                                    : const Icon(Icons.print_rounded, size: 17),
+                                label: Text('Cetak (${paperWidth}mm)'),
+                              ),
+                            ),
+                            const SizedBox(width: 10),
+                            Expanded(
+                              child: ElevatedButton(
+                                onPressed: () => Navigator.of(context).pop(),
+                                child: const Text('Selesai'),
+                              ),
+                            ),
+                          ],
                         ),
-                        const SizedBox(width: 10),
-                        Expanded(
-                          child: ElevatedButton(
-                            onPressed: () => Navigator.of(context).pop(),
-                            child: const Text('Selesai'),
+                        if (allowVoid && !isVoided) ...[
+                          const SizedBox(height: 8),
+                          SizedBox(
+                            width: double.infinity,
+                            child: OutlinedButton.icon(
+                              onPressed: () async {
+                                final corrected = await showDialog<bool>(
+                                  context: context,
+                                  barrierDismissible: false,
+                                  builder: (_) => CorrectTransactionDialog(transaction: transaction),
+                                );
+                                if (corrected == true && context.mounted) Navigator.of(context).pop();
+                              },
+                              icon: const Icon(Icons.edit_outlined, size: 16),
+                              label: const Text('Koreksi Item Transaksi'),
+                            ),
                           ),
-                        ),
+                        ],
+                        if (canVoidNow) ...[
+                          const SizedBox(height: 8),
+                          SizedBox(
+                            width: double.infinity,
+                            child: TextButton.icon(
+                              onPressed: () => _confirmVoid(context, pos),
+                              style: TextButton.styleFrom(
+                                foregroundColor: AppTheme.dangerRed,
+                              ),
+                              icon: const Icon(Icons.undo_rounded, size: 16),
+                              label: const Text('Void / Batalkan Transaksi & Kembalikan Stok'),
+                            ),
+                          ),
+                        ],
                       ],
                     ),
-                    if (allowVoid && !isVoided) ...[
-                      const SizedBox(height: 8),
-                      SizedBox(
-                        width: double.infinity,
-                        child: OutlinedButton.icon(
-                          onPressed: () async {
-                            final corrected = await showDialog<bool>(
-                              context: context,
-                              barrierDismissible: false,
-                              builder: (_) => CorrectTransactionDialog(transaction: transaction),
-                            );
-                            if (corrected == true && context.mounted) Navigator.of(context).pop();
-                          },
-                          icon: const Icon(Icons.edit_outlined, size: 16),
-                          label: const Text('Koreksi Item Transaksi'),
-                        ),
-                      ),
-                    ],
-                    if (canVoidNow) ...[
-                      const SizedBox(height: 8),
-                      SizedBox(
-                        width: double.infinity,
-                        child: TextButton.icon(
-                          onPressed: () => _confirmVoid(context, pos),
-                          style: TextButton.styleFrom(
-                            foregroundColor: AppTheme.dangerRed,
-                          ),
-                          icon: const Icon(Icons.undo_rounded, size: 16),
-                          label: const Text('Void / Batalkan Transaksi & Kembalikan Stok'),
-                        ),
-                      ),
-                    ],
-                  ],
+                  ),
                 ),
               ),
             ],
@@ -489,21 +504,27 @@ class _ReceiptDialogState extends State<ReceiptDialog> {
     return Row(
       mainAxisAlignment: MainAxisAlignment.spaceBetween,
       children: [
-        Text(
-          label,
-          style: TextStyle(
-            fontSize: isBold ? 13.5 : 12,
-            fontWeight: isBold ? FontWeight.w800 : FontWeight.w500,
-            color: isHighlight ? AppTheme.successGreen : AppTheme.textMain,
+        Expanded(
+          child: Text(
+            label,
+            style: TextStyle(
+              fontSize: isBold ? 13.5 : 12,
+              fontWeight: isBold ? FontWeight.w800 : FontWeight.w500,
+              color: isHighlight ? AppTheme.successGreen : AppTheme.textMain,
+            ),
           ),
         ),
-        Text(
-          value,
-          style: TextStyle(
-            fontSize: isBold ? 15.5 : 12,
-            fontWeight: isBold ? FontWeight.w900 : FontWeight.w600,
-            color: isHighlight ? AppTheme.successGreen : AppTheme.textMain,
-            fontFeatures: AppTheme.tabularFigures,
+        const SizedBox(width: 8),
+        Flexible(
+          child: Text(
+            value,
+            textAlign: TextAlign.right,
+            style: TextStyle(
+              fontSize: isBold ? 15.5 : 12,
+              fontWeight: isBold ? FontWeight.w900 : FontWeight.w600,
+              color: isHighlight ? AppTheme.successGreen : AppTheme.textMain,
+              fontFeatures: AppTheme.tabularFigures,
+            ),
           ),
         ),
       ],

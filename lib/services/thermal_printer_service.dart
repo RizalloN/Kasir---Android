@@ -189,7 +189,7 @@ class ThermalPrinterService {
 
       final sent = await PrintBluetoothThermal.writeBytes(bytes);
       if (sent) {
-        return const PrintResult(success: true, message: 'Struk uji coba berhasil dicetak!');
+        return const PrintResult(success: true, message: 'Data struk uji coba berhasil dikirim ke printer.');
       } else {
         return const PrintResult(
           success: false,
@@ -199,6 +199,218 @@ class ThermalPrinterService {
     } catch (e) {
       return PrintResult(success: false, message: 'Gagal mencetak struk uji coba: $e');
     }
+  }
+
+  // The printer library uses Latin-1; substitute unsupported characters and
+  // control codes so a customer name or note cannot abort a receipt or send
+  // embedded ESC/POS commands to the printer.
+  static String _printerText(String value) => String.fromCharCodes(
+      value.runes.map((rune) => rune >= 32 && rune <= 255 ? rune : 63));
+
+  @visibleForTesting
+  Future<List<int>> buildTransactionReceiptBytes(
+    TransactionRecord transaction, {int paperWidth = 58}
+  ) async {
+    final profile = await _getProfile();
+    final paperSize = paperWidth == 80 ? PaperSize.mm80 : PaperSize.mm58;
+    final generator = Generator(paperSize, profile);
+
+    List<int> bytes = [];
+    bytes += generator.reset();
+
+    // Store Title
+    bytes += generator.text(
+      'WARLOC',
+      styles: const PosStyles(
+        align: PosAlign.center,
+        bold: true,
+        height: PosTextSize.size2,
+        width: PosTextSize.size2,
+      ),
+    );
+    bytes += generator.text(
+      'Coffee, Eatery & Entertainment',
+      styles: const PosStyles(align: PosAlign.center, bold: true),
+    );
+    bytes += generator.text(
+      'Kedungmulyo, Kutorejo,',
+      styles: const PosStyles(align: PosAlign.center),
+    );
+    bytes += generator.text(
+      'Kab. Mojokerto',
+      styles: const PosStyles(align: PosAlign.center),
+    );
+    bytes += generator.hr();
+
+    if (transaction.isVoided) {
+      bytes += generator.text(
+        '*** TRANSAKSI DIBATALKAN (VOID) ***',
+        styles: const PosStyles(align: PosAlign.center, bold: true),
+      );
+      bytes += generator.hr();
+    }
+
+    // Meta Info
+    bytes += generator.row([
+      PosColumn(text: 'No. Struk', width: 4),
+      PosColumn(
+        text: _printerText(transaction.invoiceNumber),
+        width: 8,
+        styles: const PosStyles(align: PosAlign.right, bold: true),
+      ),
+    ]);
+    bytes += generator.row([
+      PosColumn(text: 'Waktu', width: 4),
+      PosColumn(
+        text: CurrencyFormatter.formatDateTime(transaction.createdAt),
+        width: 8,
+        styles: const PosStyles(align: PosAlign.right),
+      ),
+    ]);
+    bytes += generator.row([
+      PosColumn(text: 'Kasir', width: 4),
+      PosColumn(
+        text: _printerText(transaction.cashierName),
+        width: 8,
+        styles: const PosStyles(align: PosAlign.right),
+      ),
+    ]);
+    if (transaction.customerName != null && transaction.customerName!.trim().isNotEmpty) {
+      bytes += generator.row([
+        PosColumn(text: 'Pelanggan', width: 4),
+        PosColumn(
+          text: _printerText(transaction.customerName!),
+          width: 8,
+          styles: const PosStyles(align: PosAlign.right),
+        ),
+      ]);
+    }
+    bytes += generator.row([
+      PosColumn(text: 'Tipe', width: 4),
+      PosColumn(
+        text: _printerText(transaction.orderType),
+        width: 8,
+        styles: const PosStyles(align: PosAlign.right, bold: true),
+      ),
+    ]);
+    bytes += generator.row([
+      PosColumn(text: 'Metode', width: 4),
+      PosColumn(
+        text: _printerText(transaction.paymentMethod),
+        width: 8,
+        styles: const PosStyles(align: PosAlign.right),
+      ),
+    ]);
+
+    bytes += generator.hr();
+
+    // Item List
+    for (final item in transaction.items) {
+      // Item Name line
+      bytes += generator.text(
+        _printerText(item.product.name),
+        styles: const PosStyles(bold: true),
+      );
+
+      // Quantity x Price & Subtotal line
+      final qtyPrice = '${item.quantity} x ${CurrencyFormatter.format(item.product.sellPrice)}';
+      final subtotal = CurrencyFormatter.format(item.subtotal);
+      bytes += generator.row([
+        PosColumn(text: '  $qtyPrice', width: 7),
+        PosColumn(
+          text: subtotal,
+          width: 5,
+          styles: const PosStyles(align: PosAlign.right),
+        ),
+      ]);
+
+      // Note if present
+      if (item.drinkVariant != null) {
+        bytes += generator.text('  * Varian: ${item.drinkVariant}', styles: const PosStyles(fontType: PosFontType.fontB));
+      }
+      if (item.customerNote != null) {
+        bytes += generator.text(
+          _printerText('  * Catatan: ${item.customerNote}'),
+          styles: const PosStyles(fontType: PosFontType.fontB),
+        );
+      }
+    }
+
+    bytes += generator.hr();
+
+    // Totals
+    if (transaction.discountAmount > 0) {
+      bytes += generator.row([
+        PosColumn(text: 'Subtotal', width: 6),
+        PosColumn(
+          text: CurrencyFormatter.format(transaction.subtotalAmount),
+          width: 6,
+          styles: const PosStyles(align: PosAlign.right),
+        ),
+      ]);
+      bytes += generator.row([
+        PosColumn(text: 'Diskon', width: 6),
+        PosColumn(
+          text: '-${CurrencyFormatter.format(transaction.discountAmount)}',
+          width: 6,
+          styles: const PosStyles(align: PosAlign.right),
+        ),
+      ]);
+    }
+
+    bytes += generator.row([
+      PosColumn(
+        text: 'TOTAL',
+        width: 6,
+        styles: const PosStyles(bold: true, height: PosTextSize.size2),
+      ),
+      PosColumn(
+        text: CurrencyFormatter.format(transaction.totalAmount),
+        width: 6,
+        styles: const PosStyles(align: PosAlign.right, bold: true, height: PosTextSize.size2),
+      ),
+    ]);
+
+    bytes += generator.row([
+      PosColumn(text: _printerText('Bayar (${transaction.paymentMethod})'), width: 6),
+      PosColumn(
+        text: CurrencyFormatter.format(transaction.amountPaid),
+        width: 6,
+        styles: const PosStyles(align: PosAlign.right),
+      ),
+    ]);
+
+    bytes += generator.row([
+      PosColumn(text: 'Kembalian', width: 6, styles: const PosStyles(bold: true)),
+      PosColumn(
+        text: CurrencyFormatter.format(transaction.changeAmount),
+        width: 6,
+        styles: const PosStyles(align: PosAlign.right, bold: true),
+      ),
+    ]);
+
+    bytes += generator.hr();
+
+    // Footer
+    bytes += generator.text(
+      transaction.isVoided
+          ? 'STRUK VOID - STOK DIKEMBALIKAN'
+          : 'Terima Kasih Telah Berkunjung',
+      styles: const PosStyles(align: PosAlign.center, bold: true),
+    );
+    bytes += generator.text(
+      'ke Warloc',
+      styles: const PosStyles(align: PosAlign.center, bold: true),
+    );
+    bytes += generator.text(
+      'Selamat Menikmati Hidangan Anda',
+      styles: const PosStyles(align: PosAlign.center),
+    );
+
+    bytes += generator.feed(2);
+    bytes += generator.cut();
+
+    return bytes;
   }
 
   /// Prints a real transaction receipt
@@ -215,210 +427,13 @@ class ThermalPrinterService {
         );
       }
 
-      final profile = await _getProfile();
-      final paperSize = paperWidth == 80 ? PaperSize.mm80 : PaperSize.mm58;
-      final generator = Generator(paperSize, profile);
-
-      List<int> bytes = [];
-      bytes += generator.reset();
-
-      // Store Title
-      bytes += generator.text(
-        'WARLOC',
-        styles: const PosStyles(
-          align: PosAlign.center,
-          bold: true,
-          height: PosTextSize.size2,
-          width: PosTextSize.size2,
-        ),
-      );
-      bytes += generator.text(
-        'Coffee, Eatery & Entertainment',
-        styles: const PosStyles(align: PosAlign.center, bold: true),
-      );
-      bytes += generator.text(
-        'Jl. Nongkrong Warloc No. 1, Jakarta',
-        styles: const PosStyles(align: PosAlign.center),
-      );
-      bytes += generator.text(
-        'Telp: 0812-9988-7766',
-        styles: const PosStyles(align: PosAlign.center),
-      );
-      bytes += generator.hr();
-
-      if (transaction.isVoided) {
-        bytes += generator.text(
-          '*** TRANSAKSI DIBATALKAN (VOID) ***',
-          styles: const PosStyles(align: PosAlign.center, bold: true),
-        );
-        bytes += generator.hr();
-      }
-
-      // Meta Info
-      bytes += generator.row([
-        PosColumn(text: 'No. Struk', width: 4),
-        PosColumn(
-          text: transaction.invoiceNumber,
-          width: 8,
-          styles: const PosStyles(align: PosAlign.right, bold: true),
-        ),
-      ]);
-      bytes += generator.row([
-        PosColumn(text: 'Waktu', width: 4),
-        PosColumn(
-          text: CurrencyFormatter.formatDateTime(transaction.createdAt),
-          width: 8,
-          styles: const PosStyles(align: PosAlign.right),
-        ),
-      ]);
-      bytes += generator.row([
-        PosColumn(text: 'Kasir', width: 4),
-        PosColumn(
-          text: transaction.cashierName,
-          width: 8,
-          styles: const PosStyles(align: PosAlign.right),
-        ),
-      ]);
-      if (transaction.customerName != null && transaction.customerName!.trim().isNotEmpty) {
-        bytes += generator.row([
-          PosColumn(text: 'Pelanggan', width: 4),
-          PosColumn(
-            text: transaction.customerName!,
-            width: 8,
-            styles: const PosStyles(align: PosAlign.right),
-          ),
-        ]);
-      }
-      bytes += generator.row([
-        PosColumn(text: 'Tipe', width: 4),
-        PosColumn(
-          text: transaction.orderType,
-          width: 8,
-          styles: const PosStyles(align: PosAlign.right, bold: true),
-        ),
-      ]);
-      bytes += generator.row([
-        PosColumn(text: 'Metode', width: 4),
-        PosColumn(
-          text: transaction.paymentMethod,
-          width: 8,
-          styles: const PosStyles(align: PosAlign.right),
-        ),
-      ]);
-
-      bytes += generator.hr();
-
-      // Item List
-      for (final item in transaction.items) {
-        // Item Name line
-        bytes += generator.text(
-          item.product.name,
-          styles: const PosStyles(bold: true),
-        );
-
-        // Quantity x Price & Subtotal line
-        final qtyPrice = '${item.quantity} x ${CurrencyFormatter.format(item.product.sellPrice)}';
-        final subtotal = CurrencyFormatter.format(item.subtotal);
-        bytes += generator.row([
-          PosColumn(text: '  $qtyPrice', width: 7),
-          PosColumn(
-            text: subtotal,
-            width: 5,
-            styles: const PosStyles(align: PosAlign.right),
-          ),
-        ]);
-
-        // Note if present
-        if (item.drinkVariant != null) {
-          bytes += generator.text('  * Varian: ${item.drinkVariant}', styles: const PosStyles(fontType: PosFontType.fontB));
-        }
-        if (item.customerNote != null) {
-          bytes += generator.text(
-            '  * Catatan: ${item.customerNote}',
-            styles: const PosStyles(fontType: PosFontType.fontB),
-          );
-        }
-      }
-
-      bytes += generator.hr();
-
-      // Totals
-      if (transaction.discountAmount > 0) {
-        bytes += generator.row([
-          PosColumn(text: 'Subtotal', width: 6),
-          PosColumn(
-            text: CurrencyFormatter.format(transaction.subtotalAmount),
-            width: 6,
-            styles: const PosStyles(align: PosAlign.right),
-          ),
-        ]);
-        bytes += generator.row([
-          PosColumn(text: 'Diskon', width: 6),
-          PosColumn(
-            text: '-${CurrencyFormatter.format(transaction.discountAmount)}',
-            width: 6,
-            styles: const PosStyles(align: PosAlign.right),
-          ),
-        ]);
-      }
-
-      bytes += generator.row([
-        PosColumn(
-          text: 'TOTAL',
-          width: 6,
-          styles: const PosStyles(bold: true, height: PosTextSize.size2),
-        ),
-        PosColumn(
-          text: CurrencyFormatter.format(transaction.totalAmount),
-          width: 6,
-          styles: const PosStyles(align: PosAlign.right, bold: true, height: PosTextSize.size2),
-        ),
-      ]);
-
-      bytes += generator.row([
-        PosColumn(text: 'Bayar (${transaction.paymentMethod})', width: 6),
-        PosColumn(
-          text: CurrencyFormatter.format(transaction.amountPaid),
-          width: 6,
-          styles: const PosStyles(align: PosAlign.right),
-        ),
-      ]);
-
-      bytes += generator.row([
-        PosColumn(text: 'Kembalian', width: 6, styles: const PosStyles(bold: true)),
-        PosColumn(
-          text: CurrencyFormatter.format(transaction.changeAmount),
-          width: 6,
-          styles: const PosStyles(align: PosAlign.right, bold: true),
-        ),
-      ]);
-
-      bytes += generator.hr();
-
-      // Footer
-      bytes += generator.text(
-        transaction.isVoided
-            ? 'STRUK VOID - STOK DIKEMBALIKAN'
-            : 'Terima Kasih Telah Berkunjung',
-        styles: const PosStyles(align: PosAlign.center, bold: true),
-      );
-      bytes += generator.text(
-        'ke Warloc',
-        styles: const PosStyles(align: PosAlign.center, bold: true),
-      );
-      bytes += generator.text(
-        'Selamat Menikmati Hidangan Anda',
-        styles: const PosStyles(align: PosAlign.center),
-      );
-
-      bytes += generator.feed(2);
-      bytes += generator.cut();
+      final bytes = await buildTransactionReceiptBytes(transaction, paperWidth: paperWidth);
 
       final sent = await PrintBluetoothThermal.writeBytes(bytes);
       if (sent) {
         return const PrintResult(
           success: true,
-          message: 'Struk transaksi berhasil dicetak ke printer thermal!',
+          message: 'Data struk berhasil dikirim ke printer thermal.',
         );
       } else {
         return const PrintResult(

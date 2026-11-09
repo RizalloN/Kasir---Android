@@ -120,6 +120,8 @@ class PosDatabaseService {
   StreamSubscription? _firestoreUsersSub;
   StreamSubscription? _firestoreCategoriesSub;
   StreamSubscription? _firestoreExpensesSub;
+  bool _seedingProducts = false;
+  bool _seedingCategories = false;
 
   Future<void> initialize() async {
     if (_initialized) {
@@ -375,7 +377,7 @@ class PosDatabaseService {
       _firestoreProductsSub?.cancel();
       _firestoreProductsSub = _firestore!
           .collection('products')
-          .snapshots()
+          .snapshots(includeMetadataChanges: true)
           .listen(
             (snapshot) async {
               if (snapshot.docs.isNotEmpty) {
@@ -389,7 +391,7 @@ class PosDatabaseService {
 
                 // Preserve unsynced local product edits/photos & push them to Firestore
                 final unsyncedLocals = _products
-                    .where((p) => !p.isSynced)
+                    .where((p) => !p.isSynced || _seedingProducts)
                     .toList();
                 for (final localProd in unsyncedLocals) {
                   final remoteProd = remoteMap[localProd.id];
@@ -424,19 +426,28 @@ class PosDatabaseService {
                 await _persistProducts();
                 _notifyProducts();
 
-              } else if (_products.isNotEmpty) {
+              } else if (!snapshot.metadata.isFromCache &&
+                  !snapshot.metadata.hasPendingWrites && _isOnline &&
+                  _products.isNotEmpty && !_seedingProducts) {
+                _seedingProducts = true;
                 try {
-                  for (int i = 0; i < _products.length; i++) {
-                    final synced = _products[i].copyWith(isSynced: true);
-                    await _firestore!
-                        .collection('products')
-                        .doc(synced.id)
-                        .set(synced.toMap());
-                    _products[i] = synced;
+                  final initial = List<Product>.of(_products);
+                  for (var offset = 0; offset < initial.length; offset += 10) {
+                    final chunk = initial.skip(offset).take(10).toList();
+                    final batch = _firestore!.batch();
+                    for (final product in chunk) {
+                      batch.set(_firestore!.collection('products').doc(product.id),
+                          product.copyWith(isSynced: true).toMap());
+                    }
+                    await batch.commit();
+                    _acknowledgeProducts(chunk);
                   }
                   await _persistProducts();
+                  _notifyProducts();
                 } catch (e) {
                   debugPrint('Initial products seeding notice: $e');
+                } finally {
+                  _seedingProducts = false;
                 }
               }
             },
@@ -451,7 +462,7 @@ class PosDatabaseService {
           .collection('transactions')
           .orderBy('createdAt', descending: true)
           .limit(100)
-          .snapshots()
+          .snapshots(includeMetadataChanges: true)
           .listen(
             (snapshot) async {
               if (snapshot.docs.isNotEmpty) {
@@ -488,7 +499,7 @@ class PosDatabaseService {
           .collection('operational_expenses')
           .orderBy('createdAt', descending: true)
           .limit(100)
-          .snapshots()
+          .snapshots(includeMetadataChanges: true)
           .listen(
             (snapshot) async {
               if (snapshot.docs.isNotEmpty) {
@@ -496,12 +507,13 @@ class PosDatabaseService {
                 for (final doc in snapshot.docs) {
                   final exp = OperationalExpense.fromMap(
                     doc.data(),
-                  ).copyWith(isSynced: true);
+                  ).copyWith(isSynced: !doc.metadata.hasPendingWrites);
                   remoteMap[exp.id] = exp;
                 }
                 for (final localExp in _operationalExpenses) {
-                  if (!localExp.isSynced &&
-                      !remoteMap.containsKey(localExp.id)) {
+                  final remoteExp = remoteMap[localExp.id];
+                  if (!localExp.isSynced && (remoteExp == null ||
+                      !_sameExpense(localExp, remoteExp))) {
                     remoteMap[localExp.id] = localExp;
                   }
                 }
@@ -522,7 +534,7 @@ class PosDatabaseService {
       _firestoreUsersSub?.cancel();
       _firestoreUsersSub = _firestore!
           .collection('users')
-          .snapshots()
+          .snapshots(includeMetadataChanges: true)
           .listen(
             (snapshot) async {
               if (snapshot.docs.isNotEmpty) {
@@ -590,7 +602,7 @@ class PosDatabaseService {
       _firestoreCategoriesSub = _firestore!
           .collection('meta')
           .doc('categories')
-          .snapshots()
+          .snapshots(includeMetadataChanges: true)
           .listen(
             (snapshot) async {
               if (snapshot.exists && snapshot.data() != null) {
@@ -606,7 +618,9 @@ class PosDatabaseService {
                       ) &&
                       !merged.any((c) => c.toLowerCase() == 'hiburan')) {
                     merged.add('Hiburan');
-                    if (_isOnline) {
+                    if (_isOnline && !snapshot.metadata.isFromCache &&
+                        !snapshot.metadata.hasPendingWrites && !_seedingCategories) {
+                      _seedingCategories = true;
                       try {
                         await _firestore!
                             .collection('meta')
@@ -614,7 +628,10 @@ class PosDatabaseService {
                             .set({
                               'list': merged.toList()..sort(),
                             }, SetOptions(merge: true));
-                      } catch (_) {}
+                      } catch (_) {
+                      } finally {
+                        _seedingCategories = false;
+                      }
                     }
                   }
                   _categories
@@ -623,7 +640,10 @@ class PosDatabaseService {
                   await _persistCategories();
                   _notifyCategories();
                 }
-              } else if (_categories.isNotEmpty) {
+              } else if (_categories.isNotEmpty && _isOnline &&
+                  !snapshot.metadata.isFromCache &&
+                  !snapshot.metadata.hasPendingWrites && !_seedingCategories) {
+                _seedingCategories = true;
                 try {
                   await _firestore!
                       .collection('meta')
@@ -631,6 +651,8 @@ class PosDatabaseService {
                       .set({'list': _categories}, SetOptions(merge: true));
                 } catch (e) {
                   debugPrint('Initial categories seeding notice: $e');
+                } finally {
+                  _seedingCategories = false;
                 }
               }
             },
@@ -655,7 +677,17 @@ class PosDatabaseService {
     ).toList();
   }
 
-  bool _isSyncingPending = false;
+  Future<void>? _pendingSyncFuture;
+  final Map<String, int> _activeProductWrites = {};
+  final Map<String, int> _activeTransactionWrites = {};
+  final Map<String, int> _activeExpenseWrites = {};
+
+  void _trackWrites(Map<String, int> counts, Iterable<String> ids, int delta) {
+    for (final id in ids) {
+      final count = (counts[id] ?? 0) + delta;
+      if (count <= 0) { counts.remove(id); } else { counts[id] = count; }
+    }
+  }
 
   void setOnlineStatus(bool online) {
     _isOnline = online;
@@ -664,37 +696,91 @@ class PosDatabaseService {
     }
   }
 
-  Future<void> _syncPendingOfflineData() async {
-    if (_isSyncingPending || _firestore == null || !_isOnline) return;
-    _isSyncingPending = true;
-    try {
-      await _syncPendingOfflineProducts();
-      await _syncPendingOfflineTransactions();
-      await _syncPendingOfflineExpenses();
-    } finally {
-      _isSyncingPending = false;
-    }
+  Future<void> _syncPendingOfflineData() {
+    final existing = _pendingSyncFuture;
+    if (existing != null) return existing;
+    if (_firestore == null || !_isOnline) return Future.value();
+    late final Future<void> attempt;
+    attempt = _runPendingOfflineData().whenComplete(() {
+      if (identical(_pendingSyncFuture, attempt)) _pendingSyncFuture = null;
+    });
+    _pendingSyncFuture = attempt;
+    return attempt;
+  }
+
+  Future<void> _runPendingOfflineData() async {
+    await _syncPendingOfflineProducts();
+    await _syncPendingOfflineTransactions();
+    await _syncPendingOfflineExpenses();
+  }
+
+  bool get _hasPendingOfflineData => _products.any((p) => !p.isSynced) ||
+      _transactions.any((t) => !t.isSynced) ||
+      _operationalExpenses.any((e) => !e.isSynced);
+
+  static bool _sameProduct(Product a, Product b) =>
+      jsonEncode(_canonicalJson(a.copyWith(isSynced: false).toMap())) ==
+      jsonEncode(_canonicalJson(b.copyWith(isSynced: false).toMap()));
+
+  static bool _sameExpense(OperationalExpense a, OperationalExpense b) =>
+      jsonEncode(_canonicalJson(a.copyWith(isSynced: false).toMap())) ==
+      jsonEncode(_canonicalJson(b.copyWith(isSynced: false).toMap()));
+
+  @visibleForTesting
+  static List<Product> acknowledgeProducts(List<Product> current, List<Product> committed) {
+    final sent = {for (final product in committed) product.id: product};
+    return current.map((product) {
+      final original = sent[product.id];
+      return original != null && !product.isSynced && _sameProduct(product, original)
+          ? product.copyWith(isSynced: true) : product;
+    }).toList();
+  }
+
+  @visibleForTesting
+  static List<OperationalExpense> acknowledgeExpenses(
+      List<OperationalExpense> current, List<OperationalExpense> committed) {
+    final sent = {for (final expense in committed) expense.id: expense};
+    return current.map((expense) {
+      final original = sent[expense.id];
+      return original != null && !expense.isSynced && _sameExpense(expense, original)
+          ? expense.copyWith(isSynced: true) : expense;
+    }).toList();
+  }
+
+  void _acknowledgeProducts(List<Product> committed) {
+    final updated = acknowledgeProducts(_products, committed);
+    _products..clear()..addAll(updated);
   }
 
   Future<void> _syncPendingOfflineProducts() async {
     if (_firestore == null) return;
-    final unsynced = _products.where((p) => !p.isSynced).toList();
+    if (_seedingProducts) return;
+    final unsynced = _products.where((p) => !p.isSynced && !_activeProductWrites.containsKey(p.id)).toList();
     if (unsynced.isEmpty) return;
 
     try {
-      final batch = _firestore!.batch();
-      for (final p in unsynced) {
-        final synced = p.copyWith(isSynced: true);
-        batch.set(_firestore!.collection('products').doc(synced.id), synced.toMap(), SetOptions(merge: true));
-      }
-      await batch.commit();
-
-      for (int i = 0; i < _products.length; i++) {
-        if (!_products[i].isSynced) {
-          _products[i] = _products[i].copyWith(isSynced: true);
+      for (var offset = 0; offset < unsynced.length; offset += 10) {
+        final chunk = unsynced.skip(offset).take(10).toList();
+        final batch = _firestore!.batch();
+        for (final product in chunk) {
+          batch.set(_firestore!.collection('products').doc(product.id),
+              product.copyWith(isSynced: true).toMap(), SetOptions(merge: true));
+        }
+        await batch.commit();
+        final before = List<Product>.of(_products);
+        _acknowledgeProducts(chunk);
+        try {
+          await _persistProducts();
+        } catch (_) {
+          for (final previous in before.where((p) => !p.isSynced)) {
+            final index = _products.indexWhere((p) => p.id == previous.id);
+            if (index >= 0 && _products[index].isSynced && _sameProduct(_products[index], previous)) {
+              _products[index] = previous;
+            }
+          }
+          rethrow;
         }
       }
-      await _persistProducts();
       _notifyProducts();
     } catch (e) {
       debugPrint('Batch sync products notice: $e');
@@ -704,10 +790,10 @@ class PosDatabaseService {
   Future<void> _syncPendingOfflineTransactions() async {
     if (_firestore == null) return;
     bool hasChanges = false;
-    for (int i = 0; i < _transactions.length; i++) {
-      if (!_transactions[i].isSynced) {
+    final pending = _transactions.where((t) => !t.isSynced && !_activeTransactionWrites.containsKey(t.id)).toList();
+    for (final pendingTx in pending) {
         try {
-          final syncedTx = _transactions[i].copyWith(isSynced: true);
+          final syncedTx = pendingTx.copyWith(isSynced: true);
           final ref = _firestore!.collection('transactions').doc(syncedTx.id);
           final newer = await _firestore!.runTransaction<TransactionRecord?>((transaction) async {
             final snapshot = await transaction.get(ref);
@@ -722,14 +808,19 @@ class PosDatabaseService {
             return null;
           });
           final index = _transactions.indexWhere((t) => t.id == syncedTx.id);
-          if (index >= 0 && _transactions[index].revision <= (newer?.revision ?? syncedTx.revision)) {
-            _transactions[index] = newer ?? syncedTx;
+          if (index >= 0) {
+            final current = _transactions[index];
+            if (newer != null && (newer.revision > current.revision ||
+                (newer.revision == current.revision && newer.isVoided && !current.isVoided))) {
+              _transactions[index] = newer;
+            } else if (newer == null && _sameTransaction(current, syncedTx)) {
+              _transactions[index] = current.copyWith(isSynced: true);
+            }
           }
           hasChanges = true;
         } catch (e) {
-          debugPrint('Failed to sync transaction ${_transactions[i].id}: $e');
+          debugPrint('Failed to sync transaction ${pendingTx.id}: $e');
         }
-      }
     }
     if (hasChanges) {
       await _persistTransactions();
@@ -739,23 +830,33 @@ class PosDatabaseService {
 
   Future<void> _syncPendingOfflineExpenses() async {
     if (_firestore == null) return;
-    final unsynced = _operationalExpenses.where((e) => !e.isSynced).toList();
+    final unsynced = _operationalExpenses.where((e) => !e.isSynced && !_activeExpenseWrites.containsKey(e.id)).toList();
     if (unsynced.isEmpty) return;
 
     try {
-      final batch = _firestore!.batch();
-      for (final exp in unsynced) {
-        final synced = exp.copyWith(isSynced: true);
-        batch.set(_firestore!.collection('operational_expenses').doc(synced.id), synced.toMap(), SetOptions(merge: true));
-      }
-      await batch.commit();
-
-      for (int i = 0; i < _operationalExpenses.length; i++) {
-        if (!_operationalExpenses[i].isSynced) {
-          _operationalExpenses[i] = _operationalExpenses[i].copyWith(isSynced: true);
+      for (var offset = 0; offset < unsynced.length; offset += 100) {
+        final chunk = unsynced.skip(offset).take(100).toList();
+        final batch = _firestore!.batch();
+        for (final expense in chunk) {
+          batch.set(_firestore!.collection('operational_expenses').doc(expense.id),
+              expense.copyWith(isSynced: true).toMap(), SetOptions(merge: true));
+        }
+        await batch.commit();
+        final before = List<OperationalExpense>.of(_operationalExpenses);
+        final updated = acknowledgeExpenses(_operationalExpenses, chunk);
+        _operationalExpenses..clear()..addAll(updated);
+        try {
+          await _persistOperationalExpenses();
+        } catch (_) {
+          for (final previous in before.where((e) => !e.isSynced)) {
+            final index = _operationalExpenses.indexWhere((e) => e.id == previous.id);
+            if (index >= 0 && _operationalExpenses[index].isSynced && _sameExpense(_operationalExpenses[index], previous)) {
+              _operationalExpenses[index] = previous;
+            }
+          }
+          rethrow;
         }
       }
-      await _persistOperationalExpenses();
       _notifyOperationalExpenses();
     } catch (e) {
       debugPrint('Batch sync operational expenses notice: $e');
@@ -1189,6 +1290,8 @@ class PosDatabaseService {
       jsonEncode(_canonicalJson(b.copyWith(isSynced: false).toMap()));
 
   Future<void> _syncCheckout(TransactionRecord transaction, List<Product> products) async {
+    _trackWrites(_activeTransactionWrites, [transaction.id], 1);
+    _trackWrites(_activeProductWrites, products.map((p) => p.id), 1);
     try {
       final firestore = _firestore!;
       await firestore.runTransaction((operation) async {
@@ -1229,6 +1332,9 @@ class PosDatabaseService {
       _notifyTransactions();
     } catch (e) {
       debugPrint('Firestore checkout sync pending: $e');
+    } finally {
+      _trackWrites(_activeTransactionWrites, [transaction.id], -1);
+      _trackWrites(_activeProductWrites, products.map((p) => p.id), -1);
     }
   }
 
@@ -1528,6 +1634,8 @@ class PosDatabaseService {
     List<Product> products = const [],
     List<OperationalExpense> expenses = const [],
   }) async {
+    _trackWrites(_activeProductWrites, products.map((p) => p.id), 1);
+    _trackWrites(_activeExpenseWrites, expenses.map((e) => e.id), 1);
     try {
       final batch = _firestore!.batch();
       for (final product in products) {
@@ -1557,6 +1665,9 @@ class PosDatabaseService {
       }
     } catch (e) {
       debugPrint('Firestore batch insert sync pending: $e');
+    } finally {
+      _trackWrites(_activeProductWrites, products.map((p) => p.id), -1);
+      _trackWrites(_activeExpenseWrites, expenses.map((e) => e.id), -1);
     }
   }
 
@@ -1757,66 +1868,74 @@ class PosDatabaseService {
   Future<String?> syncForCurrentUser() async {
     _requireAccess((r) => true);
     if (_firestore == null) return 'Firebase belum terhubung.';
-    try { await _syncPendingOfflineData().timeout(const Duration(seconds: 10)); return null; }
+    if (!_isOnline) return 'Perangkat offline. Data lokal tetap tersimpan.';
+    try {
+      await _syncPendingOfflineData().timeout(const Duration(seconds: 10));
+      if (_hasPendingOfflineData || _activeProductWrites.isNotEmpty ||
+          _activeTransactionWrites.isNotEmpty || _activeExpenseWrites.isNotEmpty) {
+        return 'Masih ada data menunggu sinkronisasi. Periksa koneksi atau kuota Firebase.';
+      }
+      return null;
+    }
     catch (_) { return 'Sinkronisasi belum selesai. Data lokal tetap tersimpan.'; }
+  }
+
+  @visibleForTesting
+  static Future<int> syncChangedMetadata({
+    required List<UserProfile> localUsers,
+    required Map<String, UserProfile> remoteUsers,
+    required List<String> localCategories,
+    required List<String>? remoteCategories,
+    required Future<void> Function(UserProfile) writeUser,
+    required Future<void> Function(List<String>) writeCategories,
+  }) async {
+    var writes = 0;
+    for (final user in localUsers) {
+      final remote = remoteUsers[user.id];
+      if (remote == null ||
+          jsonEncode(_canonicalJson(remote.toMap())) !=
+              jsonEncode(_canonicalJson(user.toMap()))) {
+        await writeUser(user);
+        writes++;
+      }
+    }
+    final localSorted = List<String>.of(localCategories)..sort();
+    final remoteSorted = remoteCategories == null
+        ? null : (List<String>.of(remoteCategories)..sort());
+    if (remoteSorted == null || jsonEncode(localSorted) != jsonEncode(remoteSorted)) {
+      await writeCategories(localCategories);
+      writes++;
+    }
+    return writes;
   }
 
   Future<String?> syncAllToFirestore() async {
     _requireAccess((r) => r.canManageUsers);
-    if (_firestore == null) {
-      return 'Firebase belum terhubung pada perangkat ini.';
-    }
+    if (_firestore == null) return 'Firebase belum terhubung pada perangkat ini.';
+    final pendingError = await syncForCurrentUser();
+    if (pendingError != null) return pendingError;
     try {
-      for (int i = 0; i < _products.length; i++) {
-        final syncedProd = _products[i].copyWith(isSynced: true);
-        await _firestore!
-            .collection('products')
-            .doc(syncedProd.id)
-            .set(syncedProd.toMap());
-        _products[i] = syncedProd;
-      }
-      for (int i = 0; i < _transactions.length; i++) {
-        final synced = _transactions[i].copyWith(isSynced: true);
-        await _firestore!
-            .collection('transactions')
-            .doc(synced.id)
-            .set(synced.toMap(), SetOptions(merge: true));
-        _transactions[i] = synced;
-      }
-      for (int i = 0; i < _operationalExpenses.length; i++) {
-        final syncedExp = _operationalExpenses[i].copyWith(isSynced: true);
-        await _firestore!
-            .collection('operational_expenses')
-            .doc(syncedExp.id)
-            .set(syncedExp.toMap());
-        _operationalExpenses[i] = syncedExp;
-      }
-      for (final u in _users) {
-        await _firestore!
-            .collection('users')
-            .doc(u.id)
-            .set(u.toMap(), SetOptions(merge: true));
-      }
-      await _firestore!
-          .collection('meta')
-          .doc('categories')
-          .set({'list': _categories}, SetOptions(merge: true));
-
-      await _persistProducts();
-      await _persistTransactions();
-      await _persistOperationalExpenses();
-      await _persistUsers();
-      await _persistCategories();
-
-      _notifyProducts();
-      _notifyTransactions();
-      _notifyOperationalExpenses();
-      _notifyUsers();
-      _notifyCategories();
+      final usersSnapshot = await _firestore!.collection('users')
+          .get(const GetOptions(source: Source.server));
+      final categoriesSnapshot = await _firestore!.collection('meta')
+          .doc('categories').get(const GetOptions(source: Source.server));
+      final categoryData = categoriesSnapshot.data()?['list'];
+      await syncChangedMetadata(
+        localUsers: List<UserProfile>.of(_users),
+        remoteUsers: {for (final doc in usersSnapshot.docs)
+          doc.id: UserProfile.fromMap(doc.data())},
+        localCategories: List<String>.of(_categories),
+        remoteCategories: categoryData is List
+            ? categoryData.map((value) => value.toString()).toList() : null,
+        writeUser: (user) => _firestore!.collection('users').doc(user.id)
+            .set(user.toMap(), SetOptions(merge: true)),
+        writeCategories: (categories) => _firestore!.collection('meta')
+            .doc('categories').set({'list': categories}, SetOptions(merge: true)),
+      );
       return null;
     } catch (e) {
       debugPrint('Sync error: $e');
-      return e.toString();
+      return 'Sinkronisasi belum selesai. Data lokal tetap tersimpan.';
     }
   }
 

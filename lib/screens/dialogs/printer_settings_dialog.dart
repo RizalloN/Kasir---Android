@@ -21,6 +21,7 @@ class _PrinterSettingsDialogState extends State<PrinterSettingsDialog> {
   bool _isConnecting = false;
   bool _isPrintingTest = false;
   bool _bluetoothEnabled = true;
+  bool _bluetoothPermissionGranted = true;
   String? _selectedMac;
   String? _selectedName;
 
@@ -39,6 +40,7 @@ class _PrinterSettingsDialogState extends State<PrinterSettingsDialog> {
   }
 
   Future<void> _checkBluetoothAndFetchDevices() async {
+    if (_isLoadingDevices || _isConnecting) return;
     if (!(context.read<AppReleaseService?>()?.enabled('thermal_printer') ?? true)) return;
     setState(() => _isLoadingDevices = true);
     final pos = context.read<PosProvider>();
@@ -57,6 +59,7 @@ class _PrinterSettingsDialogState extends State<PrinterSettingsDialog> {
 
     if (mounted) {
       setState(() {
+        _bluetoothPermissionGranted = permitted;
         _bluetoothEnabled = btOn;
         _pairedDevices = devices;
         _isLoadingDevices = false;
@@ -69,6 +72,9 @@ class _PrinterSettingsDialogState extends State<PrinterSettingsDialog> {
         } else if (_selectedMac != null && devices.any((d) => d.macAdress == _selectedMac)) {
           final matched = devices.firstWhere((d) => d.macAdress == _selectedMac);
           _selectedName = matched.name;
+        } else if (!connected && devices.isNotEmpty) {
+          _selectedMac = null;
+          _selectedName = null;
         }
       });
     }
@@ -82,18 +88,19 @@ class _PrinterSettingsDialogState extends State<PrinterSettingsDialog> {
       final res = await _printerService.disconnect();
       if (!mounted) return;
       setState(() => _isConnecting = false);
-      await pos.setPrinterConnected(false);
+      if (res.success) await pos.setPrinterConnected(false);
 
       if (!mounted) return;
       AppTheme.showToast(
         context,
         message: res.message,
         icon: Icons.bluetooth_disabled_rounded,
+        isError: !res.success,
       );
     } else {
       // Connect
-      final mac = _selectedMac ?? pos.selectedPrinterMac;
-      if (mac.isEmpty) {
+      final mac = _selectedMac;
+      if (mac == null || !_pairedDevices.any((d) => d.macAdress == mac)) {
         AppTheme.showToast(
           context,
           message: 'Pilih printer Bluetooth terlebih dahulu dari daftar.',
@@ -218,10 +225,12 @@ class _PrinterSettingsDialogState extends State<PrinterSettingsDialog> {
                     children: [
                       const Icon(Icons.bluetooth_disabled_rounded, color: AppTheme.warningOrange, size: 20),
                       const SizedBox(width: 10),
-                      const Expanded(
+                      Expanded(
                         child: Text(
-                          'Bluetooth perangkat Anda belum aktif. Aktifkan Bluetooth di HP untuk menghubungkan printer.',
-                          style: TextStyle(fontSize: 12, color: AppTheme.textMain, fontWeight: FontWeight.w500),
+                          _bluetoothPermissionGranted
+                              ? 'Bluetooth perangkat Anda belum aktif. Aktifkan Bluetooth di HP untuk menghubungkan printer.'
+                              : 'Izin perangkat di sekitar diperlukan. Izinkan Bluetooth di pengaturan aplikasi, lalu muat ulang.',
+                          style: const TextStyle(fontSize: 12, color: AppTheme.textMain, fontWeight: FontWeight.w500),
                         ),
                       ),
                       IconButton(
@@ -272,12 +281,14 @@ class _PrinterSettingsDialogState extends State<PrinterSettingsDialog> {
               Row(
                 mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
-                  const Text(
-                    'Pilih Printer Bluetooth (Paired)',
-                    style: TextStyle(
-                      fontSize: 12,
-                      fontWeight: FontWeight.w700,
-                      color: AppTheme.textMain,
+                  const Expanded(
+                    child: Text(
+                      'Pilih Printer Bluetooth (Paired)',
+                      style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w700,
+                        color: AppTheme.textMain,
+                      ),
                     ),
                   ),
                   InkWell(
@@ -343,7 +354,7 @@ class _PrinterSettingsDialogState extends State<PrinterSettingsDialog> {
                       isExpanded: true,
                       value: _pairedDevices.any((d) => d.macAdress == _selectedMac)
                           ? _selectedMac
-                          : (_pairedDevices.isNotEmpty ? _pairedDevices.first.macAdress : null),
+                          : null,
                       hint: const Text('Pilih perangkat printer...', style: TextStyle(fontSize: 13)),
                       items: _pairedDevices.map((device) {
                         return DropdownMenuItem<String>(
@@ -381,7 +392,7 @@ class _PrinterSettingsDialogState extends State<PrinterSettingsDialog> {
                           ),
                         );
                       }).toList(),
-                      onChanged: (mac) {
+                      onChanged: pos.isPrinterConnected || _isConnecting ? null : (mac) {
                         if (mac != null) {
                           final dev = _pairedDevices.firstWhere((d) => d.macAdress == mac);
                           setState(() {
