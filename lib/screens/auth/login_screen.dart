@@ -57,13 +57,15 @@ class _LoginScreenState extends State<LoginScreen> {
 
   @override
   Widget build(BuildContext context) {
+    // Keyboard resizing must not replace the focused login form's widget tree.
+    final layoutHeight = MediaQuery.sizeOf(context).height - MediaQuery.viewPaddingOf(context).vertical;
     return Scaffold(
       backgroundColor: AppTheme.espressoDark,
       body: SafeArea(
         child: LayoutBuilder(
           builder: (context, constraints) {
             final isWide =
-                constraints.maxWidth >= 880 && constraints.maxHeight >= 500;
+                constraints.maxWidth >= 880 && layoutHeight >= 500;
 
             if (isWide) {
               return Center(
@@ -93,7 +95,7 @@ class _LoginScreenState extends State<LoginScreen> {
               );
             }
 
-            final isCompact = constraints.maxHeight < 680;
+            final isCompact = layoutHeight < 680;
             return Center(
               child: SingleChildScrollView(
                 padding: const EdgeInsets.symmetric(

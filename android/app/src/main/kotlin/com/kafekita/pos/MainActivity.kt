@@ -3,6 +3,10 @@ package com.kafekita.pos
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
+import io.flutter.plugin.common.EventChannel
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
@@ -18,6 +22,13 @@ import java.util.concurrent.Executors
 
 class MainActivity: FlutterActivity() {
     private val storageWorker = Executors.newSingleThreadExecutor()
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private val connectivity by lazy { getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager }
+
+    private fun stopNetworkMonitor() {
+        networkCallback?.let { connectivity.unregisterNetworkCallback(it) }
+        networkCallback = null
+    }
 
     private fun storageKey(): SecretKey {
         val store = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
@@ -33,12 +44,51 @@ class MainActivity: FlutterActivity() {
     }
 
     override fun onDestroy() {
+        stopNetworkMonitor()
         storageWorker.shutdown()
         super.onDestroy()
     }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+        EventChannel(flutterEngine.dartExecutor.binaryMessenger, "com.kafekita.pos/network")
+            .setStreamHandler(object : EventChannel.StreamHandler {
+                override fun onListen(arguments: Any?, events: EventChannel.EventSink) {
+                    stopNetworkMonitor()
+                    fun emit() = runOnUiThread {
+                        val capabilities = connectivity.getNetworkCapabilities(connectivity.activeNetwork)
+                        events.success(capabilities?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true &&
+                            capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED))
+                    }
+                    val callback = object : ConnectivityManager.NetworkCallback() {
+                        override fun onAvailable(network: Network) { emit() }
+                        override fun onLost(network: Network) { emit() }
+                        override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) { emit() }
+                    }
+                    networkCallback = callback
+                    connectivity.registerDefaultNetworkCallback(callback)
+                    emit()
+                }
+                override fun onCancel(arguments: Any?) { stopNetworkMonitor() }
+            })
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "com.kafekita.pos/firestore_safety")
+            .setMethodCallHandler { call, result ->
+                storageWorker.execute {
+                    try {
+                        val project = checkNotNull(call.argument<String>("projectId"))
+                        val inspector = FirestoreQueueInspector(this)
+                        val value = when (call.method) {
+                            "inspectQueue" -> inspector.inspect(project)
+                            "backupQueue" -> inspector.backup(project,
+                                checkNotNull(call.argument<Number>("expectedBatches")).toLong())
+                            else -> throw IllegalArgumentException("Unknown safety operation")
+                        }
+                        runOnUiThread { result.success(value) }
+                    } catch (_: Exception) {
+                        runOnUiThread { result.error("firestore_queue_review", "Antrean perlu diperiksa sebelum sinkronisasi.", null) }
+                    }
+                }
+            }
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "com.kafekita.pos/secure_store")
             .setMethodCallHandler { call, result ->
                 storageWorker.execute {

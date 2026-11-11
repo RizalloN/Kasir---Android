@@ -1,7 +1,11 @@
 # Pembaruan APK dan kontrol fitur Warloc
 
-Aplikasi memeriksa rilis saat dibuka, ketika kembali aktif, dan melalui menu
-**Pembaruan Aplikasi**. Jika ada versi lebih baru, banner tampil setelah login.
+Pemeriksaan pembaruan otomatis dinonaktifkan. Aplikasi tidak memantau perubahan
+repo, tidak berlangganan metadata rilis Firestore, dan tidak memeriksa server saat
+dibuka atau kembali aktif. Buka **Pembaruan Aplikasi**, lalu pilih **Periksa
+Pembaruan** untuk pemeriksaan manual; percobaan dibatasi satu kali per 30 detik.
+Versi lokal dan konfigurasi terakhir dibaca dari perangkat tanpa akses Firestore.
+Jika pemeriksaan menemukan versi lebih baru, banner dapat tampil setelah login.
 Unduhan dibuka di browser. Pengguna membuka APK hasil unduhan dan menyetujui
 pembaruan melalui Android. Tidak ada pemasangan diam-diam.
 
@@ -38,6 +42,10 @@ Jangan gunakan contoh URL di atas sebagai URL produksi.
 
 ## Kontrol fitur tanpa merilis APK
 
+Perubahan flag diterapkan setelah pemeriksaan manual. Konfigurasi terakhir yang
+berhasil diperiksa disimpan lokal untuk digunakan saat offline; tidak ada listener
+atau polling otomatis untuk mengambil perubahan flag dari server.
+
 Ubah nilai `features` di Firebase Console:
 
 | Field | Pengaruh ketika `false` |
@@ -46,11 +54,29 @@ Ubah nilai `features` di Firebase Console:
 | `product_images` | Menggunakan placeholder gambar produk, tanpa menghapus foto |
 | `thermal_printer` | Menonaktifkan akses pengaturan, koneksi, dan pencetakan thermal |
 
-Perubahan diterapkan lewat listener Firestore. Ketika offline, cache Firestore
-Android tetap dapat menyediakan konfigurasi sebelumnya; perubahan baru memerlukan
-koneksi. Instalasi pertama tanpa konfigurasi menggunakan semua fitur aktif.
-Pemeriksaan versi yang gagal tidak menghalangi kasir. Tombol **Periksa Lagi**
-menampilkan kegagalan koneksi/konfigurasi dan dapat dicoba kembali.
+Perubahan diterapkan setelah pemeriksaan manual berhasil. Ketika offline,
+konfigurasi terakhir dibaca dari penyimpanan lokal. Instalasi pertama tanpa
+konfigurasi menggunakan semua fitur aktif. Pemeriksaan versi yang gagal tidak
+menghalangi kasir.
+
+## Sinkronisasi data kasir
+
+Sinkronisasi data penjualan berjalan otomatis, terpisah dari pemeriksaan APK.
+Indikator koneksi hanya menampilkan status dan jumlah data tertunda; pengguna
+tidak dapat mengganti mode jaringan atau memaksa sinkronisasi ulang.
+
+Data disimpan lokal dahulu. Saat Android mendeteksi internet tersedia, satu
+pekerja mengirim antrean secara bertahap. Percobaan gagal memakai jeda bertingkat
+yang tetap berlaku setelah restart. Saat tidak ada antrean, pemeriksaan lokal
+tidak melakukan polling Firestore. Penjualan dan perubahan stok dikonfirmasi
+dalam satu transaksi Firestore dengan ID penjualan yang sama saat dicoba ulang.
+
+Proteksi kuota tetap berlaku per perangkat: maksimal 5.000 reservasi dokumen per
+jendela 24 jam, 200 per menit, dan 20 per dokumen per menit. Batas tersebut bukan
+pembatas total proyek. Kuota habis menahan jaringan Firestore selama satu jam;
+konfirmasi tertunda menahannya lima menit. Pemulihan berlangsung otomatis setelah
+jeda dan koneksi tersedia. Antrean yang gagal diperiksa tetap ditahan untuk
+pemeriksaan, sedangkan konflik stok/data tidak dibuang atau dianggap berhasil.
 
 Switch ini mengendalikan fitur yang kodenya sudah ada di APK. Fitur dengan kode
 baru tetap memerlukan APK baru. Switch bukan pengganti hak akses pengguna.

@@ -510,7 +510,7 @@ class _OperationalExpensesScreenState extends State<OperationalExpensesScreen> {
   @override
   Widget build(BuildContext context) {
     final access = context.watch<PosProvider>();
-    if (!access.isAuthenticated || !access.currentRole.canViewFinancialReports) return const AccessDenied();
+    if (!access.isAuthenticated || !access.currentRole.canManageOperationalExpenses) return const AccessDenied();
     final pos = context.watch<PosProvider>();
     final now = DateTime.now();
 

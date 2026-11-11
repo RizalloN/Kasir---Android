@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
+import '../../models/user_role.dart';
 import '../../providers/pos_provider.dart';
+import '../../widgets/access_denied.dart';
 
 class ChangePasswordScreen extends StatefulWidget {
   const ChangePasswordScreen({super.key});
@@ -23,7 +25,10 @@ class _ChangePasswordScreenState extends State<ChangePasswordScreen> {
   }
 
   @override
-  Widget build(BuildContext context) => Scaffold(
+  Widget build(BuildContext context) {
+    final pos = context.watch<PosProvider>();
+    if (!pos.isAuthenticated || !pos.currentRole.canChangeOwnPassword) return const AccessDenied();
+    return Scaffold(
         appBar: AppBar(title: const Text('Ganti Password'), actions: [
           TextButton(
             onPressed: _busy ? null : context.read<PosProvider>().logout,
@@ -118,4 +123,5 @@ class _ChangePasswordScreenState extends State<ChangePasswordScreen> {
                           ]),
                     )))),
       );
+  }
 }

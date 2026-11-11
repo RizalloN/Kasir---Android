@@ -13,7 +13,9 @@ import '../../widgets/product_image_widget.dart';
 import '../../services/app_release_service.dart';
 
 class PosScreen extends StatefulWidget {
-  const PosScreen({super.key});
+  final ValueChanged<String>? onBillSaved;
+  final VoidCallback? onBillCancelled;
+  const PosScreen({super.key, this.onBillSaved, this.onBillCancelled});
 
   @override
   State<PosScreen> createState() => _PosScreenState();
@@ -252,37 +254,27 @@ class _PosScreenState extends State<PosScreen> {
     return LayoutBuilder(
       builder: (context, constraints) {
         final scale = MediaQuery.textScalerOf(context).scale(1).clamp(1.0, 1.5);
+        // The parent Scaffold already removes keyboard insets from its body.
+        // Use the window height so opening the IME cannot replace the cart/search.
         final isTablet = constraints.maxWidth >= 960 * scale &&
-            constraints.maxHeight + MediaQuery.viewInsetsOf(context).bottom >= 560;
+            MediaQuery.sizeOf(context).height >= 560;
+        final keyboardVisible = View.of(context).viewInsets.bottom > 0 || MediaQuery.viewInsetsOf(context).bottom > 0;
 
         if (isTablet) {
           return Scaffold(
+            resizeToAvoidBottomInset: false,
             backgroundColor: AppTheme.surfaceLight,
             body: Row(
               children: [
                 Expanded(
-                  child: Column(
-                    children: [
-                      _buildSearchBar(context, pos),
-                      _buildCategoryChips(pos),
-                      const SizedBox(height: 8),
-                      Expanded(
-                        child: _buildProductGrid(
-                          context,
-                          products,
-                          pos,
-                          isTablet: true,
-                        ),
-                      ),
-                    ],
-                  ),
+                  child: _buildCatalogBody(context, products, pos, isTablet: true),
                 ),
                 const VerticalDivider(width: 1, color: AppTheme.borderSubtle),
                 SizedBox(
                   width: 380 * scale,
-                  child: const ColoredBox(
+                  child: ColoredBox(
                     color: AppTheme.cardBg,
-                    child: CartBottomSheet(isTabletSidebar: true),
+                    child: CartBottomSheet(isTabletSidebar: true, onBillSaved: widget.onBillSaved, onBillCancelled: widget.onBillCancelled),
                   ),
                 ),
               ],
@@ -291,23 +283,10 @@ class _PosScreenState extends State<PosScreen> {
         }
 
         return Scaffold(
+          resizeToAvoidBottomInset: false,
           backgroundColor: AppTheme.surfaceLight,
-          body: Column(
-            children: [
-              _buildSearchBar(context, pos),
-              _buildCategoryChips(pos),
-              const SizedBox(height: 8),
-              Expanded(
-                child: _buildProductGrid(
-                  context,
-                  products,
-                  pos,
-                  isTablet: false,
-                ),
-              ),
-            ],
-          ),
-          bottomNavigationBar: pos.cart.isEmpty
+          body: _buildCatalogBody(context, products, pos, isTablet: false),
+          bottomNavigationBar: pos.cart.isEmpty || keyboardVisible
               ? null
               : Container(
                   padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
@@ -363,7 +342,7 @@ class _PosScreenState extends State<PosScreen> {
                               useSafeArea: true,
                               builder: (sheetContext) => Padding(
                                 padding: EdgeInsets.only(bottom: MediaQuery.viewInsetsOf(sheetContext).bottom),
-                                child: const CartBottomSheet(),
+                                child: CartBottomSheet(onBillSaved: widget.onBillSaved, onBillCancelled: widget.onBillCancelled),
                               ),
                             );
                           },
@@ -377,6 +356,16 @@ class _PosScreenState extends State<PosScreen> {
         );
       },
     );
+  }
+
+  Widget _buildCatalogBody(BuildContext context, List<Product> products, PosProvider pos, {required bool isTablet}) {
+    return LayoutBuilder(builder: (context, constraints) => Column(children: [
+      ConstrainedBox(constraints: BoxConstraints(maxHeight: constraints.maxHeight),
+        child: SingleChildScrollView(primary: false, child: Column(mainAxisSize: MainAxisSize.min, children: [
+          _buildSearchBar(context, pos), _buildCategoryChips(pos), const SizedBox(height: 8),
+        ]))),
+      Expanded(child: _buildProductGrid(context, products, pos, isTablet: isTablet)),
+    ]));
   }
 
   Widget _buildSearchBar(BuildContext context, PosProvider pos) {
@@ -552,7 +541,7 @@ class _PosScreenState extends State<PosScreen> {
   }) {
     if (products.isEmpty) {
       return Center(
-        child: Padding(
+        child: SingleChildScrollView(child: Padding(
           padding: const EdgeInsets.all(24),
           child: Column(
             mainAxisSize: MainAxisSize.min,
@@ -598,7 +587,7 @@ class _PosScreenState extends State<PosScreen> {
               ],
             ],
           ),
-        ),
+        )),
       );
     }
 

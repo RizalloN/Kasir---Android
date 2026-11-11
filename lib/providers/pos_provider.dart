@@ -1,4 +1,6 @@
 import 'dart:async';
+import 'dart:convert';
+import 'dart:math';
 import 'package:flutter/foundation.dart';
 import '../services/secure_preferences.dart';
 import '../models/user_role.dart';
@@ -157,6 +159,20 @@ class RevenueComparisonSummary {
   }
 }
 
+class OpenBillQuote {
+  final OpenBill bill;
+  final List<CartItem> _items;
+  final double discount;
+  OpenBillQuote({required this.bill, required List<CartItem> items, required this.discount})
+      : _items = items.map((item) => item.copyWith()).toList();
+  List<CartItem> get items => List.unmodifiable(_items.map((item) => item.copyWith()));
+  double get subtotal => _items.fold(0, (sum, item) => sum + item.subtotal);
+  double get total => subtotal - discount;
+  double get cost => _items.fold(0, (sum, item) => sum + item.subtotalCost);
+  String get signature => jsonEncode({'id': bill.id, 'revision': bill.revision,
+    'discount': discount, 'items': _items.map((item) => item.toMap()).toList()});
+}
+
 class PosProvider extends ChangeNotifier {
   final PosDatabaseService _db = PosDatabaseService.instance;
 
@@ -199,26 +215,28 @@ class PosProvider extends ChangeNotifier {
   final List<CartItem> _cart = [];
   List<OpenBill> _openBills = [];
   String? _activeBillId;
+  String? get activeBillId => _activeBillId;
+  bool get isCheckoutInProgress => _checkoutInProgress;
   int? _activeBillRevision;
   bool _savingBill = false;
   StreamSubscription? _billsSub;
   List<OpenBill> get openBills => !isAuthenticated ? const [] : List.unmodifiable(
     _openBills.where((b) => currentRole != UserRole.barista || b.createdBy == _currentUser!.id));
 
-  Future<void> saveCurrentBill() async {
+  Future<OpenBill> saveCurrentBill() async {
     if (_savingBill) throw StateError('Tagihan sedang disimpan.');
     _savingBill = true;
-    try { await _saveCurrentBill(); } finally { _savingBill = false; }
+    try { return await _saveCurrentBill(); } finally { _savingBill = false; }
   }
 
-  Future<void> _saveCurrentBill() async {
+  Future<OpenBill> _saveCurrentBill() async {
     _requirePermission(true);
     if (_checkoutInProgress || _cart.isEmpty) throw StateError('Pesanan kosong atau sedang diproses.');
     if (_customerName.trim().isEmpty) throw StateError('Isi nama pelanggan / meja sebelum menyimpan tagihan.');
     final existing = _activeBillId == null ? null : openBills.where((b) => b.id == _activeBillId).firstOrNull;
     if (_activeBillId != null && existing == null) throw StateError('Tagihan tidak dapat diakses.');
     final bill = OpenBill(
-      id: _activeBillId ?? 'BILL-${DateTime.now().microsecondsSinceEpoch}',
+      id: _activeBillId ?? 'BILL-${DateTime.now().microsecondsSinceEpoch}_${Random.secure().nextInt(0x7fffffff)}',
       customerName: _customerName.trim(), orderType: _orderType,
       createdBy: existing?.createdBy ?? _currentUser!.id,
       createdAt: existing?.createdAt ?? DateTime.now(),
@@ -228,6 +246,66 @@ class PosProvider extends ChangeNotifier {
     await _db.saveOpenBill(bill, expectedRevision: _activeBillRevision);
     _openBills = _db.getOpenBills();
     _resetCart();
+    return bill;
+  }
+
+  OpenBillQuote quoteOpenBill(String id) {
+    _requirePermission(true);
+    final bill = openBills.where((bill) => bill.id == id).firstOrNull;
+    if (bill == null) throw StateError('Tagihan tidak ditemukan atau akses ditolak.');
+    if (bill.items.isEmpty || !bill.discountAmount.isFinite || bill.discountAmount < 0) {
+      throw StateError('Data tagihan tidak valid. Periksa kembali pesanan.');
+    }
+    final items = <CartItem>[];
+    final quantities = <String, int>{};
+    for (final item in bill.items) {
+      final live = _products.where((product) => product.id == item.product.id).firstOrNull;
+      final quantity = (quantities[item.product.id] ?? 0) + item.quantity;
+      if (live == null || !live.isAvailable || item.quantity < 1 || quantity > live.stock ||
+          (item.drinkVariant != null && !live.isDrink) || !live.sellPrice.isFinite ||
+          live.sellPrice < 0 || !live.baseCost.isFinite || live.baseCost < 0) {
+        throw StateError('Menu atau stok tagihan berubah. Periksa menu sebelum melanjutkan.');
+      }
+      quantities[live.id] = quantity;
+      items.add(item.copyWith(product: live.copyWith(
+        sellPrice: live.sellPrice + (CartItem.variantPrices[item.drinkVariant] ?? 0))));
+    }
+    final subtotal = items.fold(0.0, (sum, item) => sum + item.subtotal);
+    if (!subtotal.isFinite) throw StateError('Nominal tagihan tidak valid.');
+    return OpenBillQuote(bill: bill, items: items, discount: bill.discountAmount.clamp(0, subtotal).toDouble());
+  }
+
+  Future<TransactionRecord> payOpenBill(OpenBillQuote reviewed, {
+    required String paymentMethod, required double amountPaid,
+  }) async {
+    _requirePermission(true);
+    if (_checkoutInProgress || _savingBill) throw StateError('Pembayaran atau penyimpanan sedang diproses.');
+    if (_activeBillId == reviewed.bill.id) throw StateError('Simpan perubahan pesanan di Menu sebelum membayar tagihan ini.');
+    if (!['Cash', 'QRIS'].contains(paymentMethod)) throw ArgumentError('Metode pembayaran tidak valid.');
+    final current = quoteOpenBill(reviewed.bill.id);
+    if (current.signature != reviewed.signature) throw StateError('Tagihan atau harga berubah. Tinjau ulang sebelum membayar.');
+    if (!amountPaid.isFinite || amountPaid < current.total || (paymentMethod == 'QRIS' && amountPaid != current.total)) {
+      throw ArgumentError('Nominal pembayaran tidak sesuai dengan total tagihan.');
+    }
+    _checkoutInProgress = true;
+    try {
+      final now = DateTime.now();
+      final id = 'INV-${now.year}${now.month.toString().padLeft(2, '0')}${now.day.toString().padLeft(2, '0')}-${now.microsecondsSinceEpoch}_${Random.secure().nextInt(0x7fffffff)}';
+      final saved = await _db.processTransaction(TransactionRecord(
+        id: id, invoiceNumber: id, items: current.items,
+        subtotalAmount: current.subtotal, discountAmount: current.discount,
+        totalAmount: current.total, totalCost: current.cost, totalProfit: current.total - current.cost,
+        paymentMethod: paymentMethod, amountPaid: amountPaid, changeAmount: amountPaid - current.total,
+        cashierName: _currentUser!.displayName, cashierId: _currentUser!.id,
+        openBillId: current.bill.id, openBillRevision: current.bill.revision,
+        orderType: current.bill.orderType, customerName: current.bill.customerName, createdAt: now,
+      ));
+      _products = _db.getProducts();
+      _transactions = _db.getTransactions();
+      _openBills = _db.getOpenBills();
+      notifyListeners();
+      return saved;
+    } finally { _checkoutInProgress = false; }
   }
 
   void resumeOpenBill(String id) {
@@ -258,10 +336,13 @@ class PosProvider extends ChangeNotifier {
   Future<void> deleteOpenBill(String id) async {
     _requirePermission(true);
     if (!openBills.any((b) => b.id == id)) throw StateError('Akses ditolak.');
-    if (_activeBillId == id || _checkoutInProgress) throw StateError('Tagihan sedang digunakan.');
-    await _db.deleteOpenBill(id);
-    _openBills = _db.getOpenBills();
-    notifyListeners();
+    if (_activeBillId == id || _checkoutInProgress || _savingBill) throw StateError('Tagihan sedang digunakan.');
+    _savingBill = true;
+    try {
+      await _db.deleteOpenBill(id);
+      _openBills = _db.getOpenBills();
+      notifyListeners();
+    } finally { _savingBill = false; }
   }
   List<CartItem> get cart => List.unmodifiable(_cart.map((i) => i.copyWith()));
 
@@ -281,7 +362,7 @@ class PosProvider extends ChangeNotifier {
   String _searchQuery = '';
   String get searchQuery => _searchQuery;
 
-  bool _isOnline = true;
+  bool _isOnline = false;
   bool get isOnline => _isOnline;
 
   // Printer Configuration (Persisted)
@@ -302,6 +383,7 @@ class PosProvider extends ChangeNotifier {
   StreamSubscription? _usersSub;
   StreamSubscription? _categoriesSub;
   StreamSubscription? _expensesSub;
+  StreamSubscription<bool>? _connectionSub;
 
   PosProvider() {
     _init();
@@ -319,6 +401,10 @@ class PosProvider extends ChangeNotifier {
   Future<void> _load() async {
     await _db.initialize();
     _isOnline = _db.isOnline;
+    _connectionSub = _db.connectionStream.listen((online) {
+      _isOnline = online;
+      if (!_disposed) notifyListeners();
+    });
     _products = _db.getProducts();
     _transactions = _db.getTransactions();
     _users = _db.getUsers();
@@ -478,7 +564,7 @@ class PosProvider extends ChangeNotifier {
   }
 
   Future<void> changeOwnPassword(String oldPassword, String newPassword) async {
-    if (!isAuthenticated) throw StateError('Akses ditolak.');
+    if (!isAuthenticated || !currentRole.canChangeOwnPassword) throw StateError('Akses ditolak.');
     if (_changingOwnPassword) throw StateError('Perubahan password sedang diproses.');
     _changingOwnPassword = true;
     try {
@@ -615,26 +701,11 @@ class PosProvider extends ChangeNotifier {
     return error;
   }
 
-  void toggleNetworkMode() {
-    _isOnline = !_isOnline;
-    _db.setOnlineStatus(_isOnline);
-    notifyListeners();
-  }
-
-  Future<String?> syncAllToCloud() async {
-    _requirePermission(true);
-    final error = await (currentRole.canManageUsers ? _db.syncAllToFirestore() : _db.syncForCurrentUser())
-      .timeout(const Duration(seconds: 12), onTimeout: () => 'Sinkronisasi belum selesai. Data lokal tetap tersimpan.');
-    _refreshFromDatabase();
-    notifyListeners();
-    return error;
-  }
-
   int get pendingSyncCount {
     final unsyncedTx = _transactions.where((t) => !t.isSynced).length;
     final unsyncedProd = _products.where((p) => !p.isSynced).length;
     final unsyncedExp = _operationalExpenses.where((e) => !e.isSynced).length;
-    return unsyncedTx + unsyncedProd + unsyncedExp;
+    return unsyncedTx + unsyncedProd + unsyncedExp + _db.pendingDeletionCount + _db.pendingMetadataCount + _db.pendingDeletedTransactionCount;
   }
 
   // Catalog Filtering
@@ -960,6 +1031,7 @@ class PosProvider extends ChangeNotifier {
   }
 
   Future<bool> voidTransaction(String transactionId) async {
+    if (_checkoutInProgress) throw StateError('Transaksi sedang diproses.');
     if (!isAuthenticated || !currentRole.canVoidTransactions) return false;
     final ok = await _db.voidTransaction(transactionId);
     _products = _db.getProducts();
@@ -976,6 +1048,7 @@ class PosProvider extends ChangeNotifier {
     required String reason,
   }) async {
     _requirePermission(true);
+    if (_checkoutInProgress) throw StateError('Transaksi sedang diproses.');
     final saved = await _db.correctTransaction(
       transactionId: transactionId, expectedRevision: expectedRevision,
       items: items, amountPaid: amountPaid, reason: reason,
@@ -986,6 +1059,31 @@ class PosProvider extends ChangeNotifier {
     notifyListeners();
     return saved;
   }
+
+  bool canCorrectTransaction(TransactionRecord transaction) =>
+      isAuthenticated && transaction.canBeCorrectedBy(
+        role: currentRole, userId: _currentUser!.id);
+
+  List<TransactionRecord> get deletedTransactions => isAuthenticated && currentRole.canDeleteTransactions
+      ? _db.getDeletedTransactions() : const [];
+  bool isTransactionDeleted(String id) => isAuthenticated && _db.isTransactionDeleted(id);
+
+  Future<TransactionRecord> deleteTransaction({required String transactionId, required int expectedRevision, required String reason}) async {
+    _requirePermission(currentRole.canDeleteTransactions);
+    if (_checkoutInProgress || _savingBill) throw StateError('Transaksi atau tagihan sedang diproses.');
+    _checkoutInProgress = true;
+    try {
+      final deleted = await _db.deleteTransaction(transactionId: transactionId, expectedRevision: expectedRevision, reason: reason);
+      _products = _db.getProducts();
+      _transactions = _db.getTransactions();
+      _reconcileCartWithCatalog();
+      notifyListeners();
+      return deleted;
+    } finally { _checkoutInProgress = false; notifyListeners(); }
+  }
+
+  ({double totalAmount, int transactionCount}) get todayStoreSales =>
+      isAuthenticated ? _db.getTodaySalesSummary() : (totalAmount: 0, transactionCount: 0);
 
   // Inventory & Product Management
   Future<void> addNewProducts(List<Product> products) async {
@@ -1046,7 +1144,7 @@ class PosProvider extends ChangeNotifier {
 
   // Operational Expenses Management (Owner)
   Future<void> addOperationalExpenses(List<OperationalExpense> expenses) async {
-    _requirePermission(currentRole.canViewFinancialReports);
+    _requirePermission(currentRole.canManageOperationalExpenses);
     final normalized = expenses.map((expense) => OperationalExpense(
       id: expense.id,
       title: expense.title.trim().isEmpty ? expense.category.trim() : expense.title.trim(),
@@ -1068,11 +1166,11 @@ class PosProvider extends ChangeNotifier {
     DateTime? createdAt,
     String? notes,
   }) async {
-    _requirePermission(currentRole.canViewFinancialReports);
+    _requirePermission(currentRole.canManageOperationalExpenses);
     if (!amount.isFinite || amount <= 0) throw ArgumentError('Nominal biaya harus positif.');
     final now = createdAt ?? DateTime.now();
     final expense = OperationalExpense(
-      id: 'exp_${DateTime.now().millisecondsSinceEpoch}',
+      id: 'exp_${DateTime.now().microsecondsSinceEpoch}_${Random.secure().nextInt(0x7fffffff)}',
       title: title.trim().isEmpty ? category.trim() : title.trim(),
       category: category.trim().isEmpty ? 'Lainnya' : category.trim(),
       amount: amount.clamp(0.0, double.infinity),
@@ -1090,7 +1188,7 @@ class PosProvider extends ChangeNotifier {
   Future<OperationalExpense?> updateOperationalExpense(
     OperationalExpense expense,
   ) async {
-    _requirePermission(currentRole.canViewFinancialReports);
+    _requirePermission(currentRole.canManageOperationalExpenses);
     if (!expense.amount.isFinite || expense.amount <= 0) throw ArgumentError('Nominal biaya harus positif.');
     final saved = await _db.updateOperationalExpense(expense);
     _operationalExpenses = _db.getOperationalExpenses();
@@ -1099,7 +1197,7 @@ class PosProvider extends ChangeNotifier {
   }
 
   Future<bool> deleteOperationalExpense(String expenseId) async {
-    if (!isAuthenticated || !currentRole.canViewFinancialReports) return false;
+    if (!isAuthenticated || !currentRole.canManageOperationalExpenses) return false;
     final ok = await _db.deleteOperationalExpense(expenseId);
     _operationalExpenses = _db.getOperationalExpenses();
     notifyListeners();
@@ -1579,6 +1677,7 @@ class PosProvider extends ChangeNotifier {
     _usersSub?.cancel();
     _categoriesSub?.cancel();
     _expensesSub?.cancel();
+    _connectionSub?.cancel();
     super.dispose();
   }
 }

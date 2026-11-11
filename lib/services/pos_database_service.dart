@@ -1,7 +1,10 @@
 import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'secure_preferences.dart';
+import 'firestore_sync_safety.dart';
+import 'automatic_sync.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import '../models/product.dart';
 import '../models/cart_item.dart';
@@ -36,6 +39,12 @@ class PosDatabaseService {
   final List<String> _categories = [];
   final List<OperationalExpense> _operationalExpenses = [];
   final List<OpenBill> _openBills = [];
+  Completer<void>? _transactionDeletion;
+  int get pendingDeletedTransactionCount => _transactions.where((tx) => tx.isDeleted && !tx.isSynced).length;
+  final Set<String> _pendingDeletes = {};
+  Future<void> _deleteQueue = Future.value();
+  Future<void>? _deletingPending;
+  int get pendingDeletionCount => _pendingDeletes.length;
   final _openBillsController = StreamController<List<OpenBill>>.broadcast();
   Stream<List<OpenBill>> get openBillsStream => _openBillsController.stream;
   List<OpenBill> getOpenBills() => _actor == null ? const [] : List.unmodifiable(_openBills.where((bill) =>
@@ -43,6 +52,7 @@ class PosDatabaseService {
     !_transactions.any((tx) => tx.openBillId == bill.id)));
 
   Future<void> saveOpenBill(OpenBill bill, {int? expectedRevision}) async {
+    if (_transactionDeletion != null) throw StateError('Penghapusan transaksi sedang disimpan.');
     _requireAccess((r) => true);
     final old = _openBills.where((b) => b.id == bill.id).firstOrNull;
     if ((old != null && old.createdBy != _actor!.id && _actor!.role == UserRole.barista) ||
@@ -73,21 +83,25 @@ class PosDatabaseService {
     }
     if (bill.discountAmount > subtotal || bill.revision != (expectedRevision ?? 0) + 1) throw StateError('Diskon/revisi tagihan tidak valid.');
     if (_transactions.any((tx) => tx.openBillId == bill.id)) throw StateError('Tagihan sudah dibayar.');
-    if (index < 0) { _openBills.add(bill); } else { _openBills[index] = bill; }
-    await _persistOpenBills();
+    final staged = List<OpenBill>.of(_openBills);
+    if (index < 0) { staged.add(bill); } else { staged[index] = bill; }
+    await _persistOpenBills(staged);
+    _openBills..clear()..addAll(staged);
     _openBillsController.add(getOpenBills());
   }
 
   Future<void> deleteOpenBill(String id) async {
+    if (_transactionDeletion != null) throw StateError('Penghapusan transaksi sedang disimpan.');
     _requireAccess((r) => true);
     final bill = _openBills.where((b) => b.id == id).firstOrNull;
     if (bill == null || (_actor!.role == UserRole.barista && bill.createdBy != _actor!.id)) throw StateError('Akses ditolak.');
-    _openBills.removeWhere((b) => b.id == id);
-    await _persistOpenBills();
+    final staged = _openBills.where((b) => b.id != id).toList();
+    await _persistOpenBills(staged);
+    _openBills..clear()..addAll(staged);
     _openBillsController.add(getOpenBills());
   }
 
-  Future<void> _persistOpenBills() => _persistLedger();
+  Future<void> _persistOpenBills(List<OpenBill> bills) => _persistLedger(openBills: bills);
 
   final _productsStreamController = StreamController<List<Product>>.broadcast();
   final _transactionsStreamController =
@@ -108,22 +122,112 @@ class PosDatabaseService {
   Stream<List<OperationalExpense>> get operationalExpensesStream =>
       _operationalExpensesStreamController.stream;
 
-  bool _isOnline = true;
+  bool _isOnline = false;
   bool get isOnline => _isOnline;
+  final _connectionController = StreamController<bool>.broadcast();
+  Stream<bool> get connectionStream => _connectionController.stream;
+  AutomaticSync? _automaticSync;
+  StreamSubscription<dynamic>? _networkSub;
+  final Map<String, Map<String, dynamic>> _pendingMetadata = {};
+  Future<void> _metadataQueue = Future.value();
+  bool _referenceCheckNeeded = false;
+  int get pendingMetadataCount => _pendingMetadata.length;
+
+  void _requestAutoSync() => _automaticSync?.request();
+
+  void _connectionChanged(bool connected) {
+    _isOnline = connected && _firestore != null && !FirestoreSyncSafety.instance.connectionBlocked;
+    _connectionController.add(_isOnline);
+  }
+
+  void _startAutomaticSync() {
+    if (_automaticSync != null || _testMode) return;
+    _automaticSync = AutomaticSync(
+      hasWork: () => _hasPendingOfflineData || _referenceCheckNeeded || FirestoreSyncSafety.instance.connectionBlocked,
+      onConnection: _connectionChanged,
+      send: _automaticSyncAttempt,
+    )..start();
+    _networkSub = const EventChannel('com.kafekita.pos/network').receiveBroadcastStream().listen(
+      (event) => _automaticSync?.networkChanged(event == true),
+      onError: (Object error) => debugPrint('Network monitor unavailable: $error'),
+    );
+  }
+
+  Future<bool> _automaticSyncAttempt() async {
+    final safety = FirestoreSyncSafety.instance;
+    if (safety.connectionBlocked) {
+      final prefs = await SecurePreferences.getInstance();
+      // A failed queue inspection requires review, not repeated automatic clearing.
+      final until = prefs.getInt('firestore_blocked_until');
+      if (until == null || !await safety.resumeIfAllowed(_firestore)) return false;
+      if (_firestore == null) _setupFirestoreLiveSync();
+    }
+    _connectionChanged(_automaticSync?.connected ?? _isOnline);
+    if (_firestore == null || !_isOnline) return false;
+    if (_referenceCheckNeeded) await _bootstrapReferenceData();
+    if (_referenceCheckNeeded) return false;
+    if (safety.pendingDocuments.isNotEmpty) {
+      try {
+        await _firestore!.waitForPendingWrites().timeout(const Duration(seconds: 15));
+        safety.pendingDocuments.clear();
+      } catch (error) {
+        _onCloudError(error);
+        await safety.suspendUnconfirmed(_firestore!);
+        _connectionChanged(false);
+        return false;
+      }
+    }
+    final before = _pendingItemCount;
+    await _syncPendingOfflineData();
+    return !safety.connectionBlocked && (!_hasPendingOfflineData || _pendingItemCount < before);
+  }
+
+  @visibleForTesting
+  Future<void> connectForTesting(FirebaseFirestore firestore, {bool online = true}) async {
+    if (!_testMode) throw StateError('Test only.');
+    _firestore = firestore;
+    _isOnline = online;
+    _referenceCheckNeeded = false;
+  }
+
+  @visibleForTesting
+  Future<void> flushForTesting() {
+    if (!_testMode) throw StateError('Test only.');
+    return _syncPendingOfflineData();
+  }
+
+  @visibleForTesting
+  Future<bool> automaticAttemptForTesting() {
+    if (!_testMode) throw StateError('Test only.');
+    return _automaticSyncAttempt();
+  }
 
   bool _initialized = false;
+  Future<void>? _initializationFuture;
   bool _loading = false;
 
   FirebaseFirestore? _firestore;
   StreamSubscription? _firestoreProductsSub;
   StreamSubscription? _firestoreTransactionsSub;
+  StreamSubscription? _firestoreDailyTransactionsSub;
+  Timer? _salesDayTimer;
+  DateTime? _salesDay;
+  List<TransactionRecord> _recentTransactionsSnapshot = [];
+  List<TransactionRecord> _dailyTransactionsSnapshot = [];
   StreamSubscription? _firestoreUsersSub;
   StreamSubscription? _firestoreCategoriesSub;
   StreamSubscription? _firestoreExpensesSub;
   bool _seedingProducts = false;
-  bool _seedingCategories = false;
+  final _writeGuard = FirestoreWriteGuard();
+  Future<void>? _bootstrapFuture;
+  final Map<String, Future<void>> _loginSyncs = {};
 
-  Future<void> initialize() async {
+  Future<void> initialize() {
+    if (_initialized) return _initializeDatabase();
+    return _initializationFuture ??= _initializeDatabase().whenComplete(() => _initializationFuture = null);
+  }
+
+  Future<void> _initializeDatabase() async {
     if (_initialized) {
       _notifyProducts();
       _notifyTransactions();
@@ -135,6 +239,11 @@ class PosDatabaseService {
 
     final prefs = await SecurePreferences.getInstance();
     _loading = true;
+    _referenceCheckNeeded = prefs.getBool('firestore_reference_bootstrap_attempted_v1') != true;
+    _pendingDeletes..clear()..addAll(
+        (jsonDecode(prefs.getString('firestore_pending_deletes_v1') ?? '[]') as List).cast<String>());
+    final metadata = jsonDecode(prefs.getString('firestore_pending_metadata_v1') ?? '{}') as Map;
+    _pendingMetadata..clear()..addAll(metadata.map((key, value) => MapEntry(key as String, Map<String, dynamic>.from(value as Map))));
     final rawLedger = prefs.getString('cached_ledger_v1');
     final ledger = rawLedger == null ? null : Map<String, dynamic>.from(jsonDecode(rawLedger) as Map);
     final savedBills = ledger == null ? prefs.getString('cached_open_bills') : jsonEncode(ledger['openBills']);
@@ -297,9 +406,14 @@ class PosDatabaseService {
     _categories
       ..clear()
       ..addAll(loadedCategories.toList()..sort());
+    _overlayPendingMetadata();
     await _persistCategories();
 
+    _products.removeWhere((p) => _pendingDeletes.contains('products/${p.id}'));
+    _users.removeWhere((u) => _pendingDeletes.contains('users/${u.id}'));
+    _operationalExpenses.removeWhere((e) => _pendingDeletes.contains('operational_expenses/${e.id}'));
     _loading = false;
+    if (_pendingDeletes.isNotEmpty) { await _persistUsers(); await _persistOperationalExpenses(); }
     await _persistLedger();
     _initialized = true;
     _notifyProducts();
@@ -309,6 +423,7 @@ class PosDatabaseService {
     _notifyOperationalExpenses();
 
     _setupFirestoreLiveSync();
+    _startAutomaticSync();
   }
 
   void _sortTransactions() {
@@ -353,6 +468,7 @@ class PosDatabaseService {
 
     final defaults = _getDefaultUsers();
     for (final def in defaults) {
+      if (_pendingDeletes.contains('users/${def.id}')) continue;
       final existingIndex = _users.indexWhere(
         (u) =>
             u.id == def.id ||
@@ -370,6 +486,8 @@ class PosDatabaseService {
   }
 
   void _setupFirestoreLiveSync() {
+    if (_testMode || _firestore != null) return;
+    if (FirestoreSyncSafety.instance.connectionBlocked) { _isOnline = false; return; }
     try {
       _firestore = FirebaseFirestore.instance;
 
@@ -380,9 +498,12 @@ class PosDatabaseService {
           .snapshots(includeMetadataChanges: true)
           .listen(
             (snapshot) async {
+              await _transactionDeletion?.future;
               if (snapshot.docs.isNotEmpty) {
                 final remoteMap = <String, Product>{};
                 for (final doc in snapshot.docs) {
+                  if (_pendingDeletes.contains('products/${doc.id}')) continue;
+                  _acknowledgeRemote('products/${doc.id}', doc.metadata);
                   final prod = Product.fromMap(
                     doc.data(),
                   ).copyWith(isSynced: !doc.metadata.hasPendingWrites);
@@ -407,52 +528,17 @@ class PosDatabaseService {
                   }
                 }
 
-                // Ensure Rental PS3 & Rental PS4 exist in remote Firestore catalog
-                for (final psItem in _getDefaultHiburanProducts()) {
-                  final hasInRemote = remoteMap.values.any(
-                    (p) =>
-                        p.id == psItem.id ||
-                        p.name.trim().toLowerCase() ==
-                            psItem.name.trim().toLowerCase(),
-                  );
-                  if (!hasInRemote) {
-                    remoteMap[psItem.id] = psItem.copyWith(isSynced: false);
-                  }
-                }
-
                 _products
                   ..clear()
                   ..addAll(remoteMap.values);
                 await _persistProducts();
                 _notifyProducts();
 
-              } else if (!snapshot.metadata.isFromCache &&
-                  !snapshot.metadata.hasPendingWrites && _isOnline &&
-                  _products.isNotEmpty && !_seedingProducts) {
-                _seedingProducts = true;
-                try {
-                  final initial = List<Product>.of(_products);
-                  for (var offset = 0; offset < initial.length; offset += 10) {
-                    final chunk = initial.skip(offset).take(10).toList();
-                    final batch = _firestore!.batch();
-                    for (final product in chunk) {
-                      batch.set(_firestore!.collection('products').doc(product.id),
-                          product.copyWith(isSynced: true).toMap());
-                    }
-                    await batch.commit();
-                    _acknowledgeProducts(chunk);
-                  }
-                  await _persistProducts();
-                  _notifyProducts();
-                } catch (e) {
-                  debugPrint('Initial products seeding notice: $e');
-                } finally {
-                  _seedingProducts = false;
-                }
+
               }
             },
             onError: (error) {
-              debugPrint('Firestore products stream notice: $error');
+              _onCloudError(error);
             },
           );
 
@@ -465,33 +551,17 @@ class PosDatabaseService {
           .snapshots(includeMetadataChanges: true)
           .listen(
             (snapshot) async {
-              if (snapshot.docs.isNotEmpty) {
-                final remoteMap = <String, TransactionRecord>{};
-                for (final doc in snapshot.docs) {
-                  final tx = TransactionRecord.fromMap(
-                    doc.data(),
-                  ).copyWith(isSynced: !doc.metadata.hasPendingWrites);
-                  remoteMap[tx.id] = tx;
-                }
-                for (final localTx in _transactions) {
-                  final remoteTx = remoteMap[localTx.id];
-                  if ((!localTx.isSynced && remoteTx == null) ||
-                      (remoteTx != null && localTx.revision > remoteTx.revision)) {
-                    remoteMap[localTx.id] = localTx;
-                  }
-                }
-                _transactions
-                  ..clear()
-                  ..addAll(remoteMap.values);
-                _sortTransactions();
-                await _persistTransactions();
-                _notifyTransactions();
-              }
+              _recentTransactionsSnapshot = snapshot.docs.map(_readRemoteTransaction).toList();
+              await _applySalesSnapshots();
             },
             onError: (error) {
-              debugPrint('Firestore transactions stream notice: $error');
+              _onCloudError(error);
             },
           );
+
+      _watchDailySales();
+      _salesDayTimer?.cancel();
+      _salesDayTimer = Timer.periodic(const Duration(minutes: 1), (_) => _watchDailySales());
 
       // Operational Expenses Sync (Limited to 100 to conserve Firestore read quota)
       _firestoreExpensesSub?.cancel();
@@ -505,6 +575,8 @@ class PosDatabaseService {
               if (snapshot.docs.isNotEmpty) {
                 final remoteMap = <String, OperationalExpense>{};
                 for (final doc in snapshot.docs) {
+                  if (_pendingDeletes.contains('operational_expenses/${doc.id}')) continue;
+                  _acknowledgeRemote('operational_expenses/${doc.id}', doc.metadata);
                   final exp = OperationalExpense.fromMap(
                     doc.data(),
                   ).copyWith(isSynced: !doc.metadata.hasPendingWrites);
@@ -526,7 +598,7 @@ class PosDatabaseService {
               }
             },
             onError: (error) {
-              debugPrint('Firestore operational_expenses stream notice: $error');
+              _onCloudError(error);
             },
           );
 
@@ -540,60 +612,29 @@ class PosDatabaseService {
               if (snapshot.docs.isNotEmpty) {
                 final legacyUsernames = {'user', 'admin', 'iggoys'};
                 final remoteUsers = snapshot.docs
-                    .map((doc) => UserProfile.fromMap(doc.data()))
+                    .map((doc) {
+                      _acknowledgeRemote('users/${doc.id}', doc.metadata);
+                      return UserProfile.fromMap(doc.data());
+                    })
                     .where(
                       (u) =>
-                          !legacyUsernames.contains(u.username.toLowerCase()),
+                          !legacyUsernames.contains(u.username.toLowerCase()) && !_pendingDeletes.contains('users/${u.id}'),
                     )
                     .toList();
 
                 _users
                   ..clear()
                   ..addAll(remoteUsers);
+                _overlayPendingMetadata();
                 _ensureDefaultUsers();
                 await _persistUsers();
                 _notifyUsers();
 
-                // Cache events (including local pending writes) are not evidence
-                // that a server account needs to be created or replaced.
-                if (snapshot.metadata.isFromCache || snapshot.metadata.hasPendingWrites) return;
 
-                // Clean up any legacy docs in Firestore and ensure current defaults exist
-                for (final doc in snapshot.docs) {
-                  final data = doc.data();
-                  final uname =
-                      (data['username'] ?? '').toString().toLowerCase();
-                  if (legacyUsernames.contains(uname) ||
-                      legacyUsernames.contains(doc.id.toLowerCase())) {
-                    try {
-                      await _firestore!.collection('users').doc(doc.id).delete();
-                    } catch (_) {}
-                  }
-                }
-                for (final def in usersMissingFromSnapshot(_users, remoteUsers)) {
-                  try {
-                    await _firestore!
-                        .collection('users')
-                        .doc(def.id)
-                        .set(def.toMap(), SetOptions(merge: true));
-                  } catch (_) {}
-                }
-              } else if (!snapshot.metadata.isFromCache &&
-                  !snapshot.metadata.hasPendingWrites && _users.isNotEmpty) {
-                try {
-                  for (final u in _users) {
-                    await _firestore!
-                        .collection('users')
-                        .doc(u.id)
-                        .set(u.toMap(), SetOptions(merge: true));
-                  }
-                } catch (e) {
-                  debugPrint('Initial users seeding notice: $e');
-                }
               }
             },
             onError: (error) {
-              debugPrint('Firestore users stream notice: $error');
+              _onCloudError(error);
             },
           );
 
@@ -605,6 +646,7 @@ class PosDatabaseService {
           .snapshots(includeMetadataChanges: true)
           .listen(
             (snapshot) async {
+              _acknowledgeRemote('meta/categories', snapshot.metadata);
               if (snapshot.exists && snapshot.data() != null) {
                 final data = snapshot.data()!;
                 final list = (data['list'] as List<dynamic>?)
@@ -618,46 +660,20 @@ class PosDatabaseService {
                       ) &&
                       !merged.any((c) => c.toLowerCase() == 'hiburan')) {
                     merged.add('Hiburan');
-                    if (_isOnline && !snapshot.metadata.isFromCache &&
-                        !snapshot.metadata.hasPendingWrites && !_seedingCategories) {
-                      _seedingCategories = true;
-                      try {
-                        await _firestore!
-                            .collection('meta')
-                            .doc('categories')
-                            .set({
-                              'list': merged.toList()..sort(),
-                            }, SetOptions(merge: true));
-                      } catch (_) {
-                      } finally {
-                        _seedingCategories = false;
-                      }
-                    }
+
                   }
                   _categories
                     ..clear()
                     ..addAll(merged.toList()..sort());
+                  _overlayPendingMetadata();
                   await _persistCategories();
                   _notifyCategories();
                 }
-              } else if (_categories.isNotEmpty && _isOnline &&
-                  !snapshot.metadata.isFromCache &&
-                  !snapshot.metadata.hasPendingWrites && !_seedingCategories) {
-                _seedingCategories = true;
-                try {
-                  await _firestore!
-                      .collection('meta')
-                      .doc('categories')
-                      .set({'list': _categories}, SetOptions(merge: true));
-                } catch (e) {
-                  debugPrint('Initial categories seeding notice: $e');
-                } finally {
-                  _seedingCategories = false;
-                }
+
               }
             },
             onError: (error) {
-              debugPrint('Firestore categories stream notice: $error');
+              _onCloudError(error);
             },
           );
     } catch (e) {
@@ -677,6 +693,202 @@ class PosDatabaseService {
     ).toList();
   }
 
+  Future<T> _cloudWrite<T>(Iterable<String> paths, Future<T> Function() send) async {
+    try {
+      // Timeout does not cancel/release the original guard reservation. A retry
+      // cannot create another SDK write while the first is still pending.
+      return await _writeGuard.run(paths, send).timeout(const Duration(seconds: 15), onTimeout: () {
+        if (_firestore != null) {
+          unawaited(FirestoreSyncSafety.instance.suspendUnconfirmed(_firestore!).catchError((Object _) {}));
+        }
+        _isOnline = false;
+        _connectionController.add(false);
+        throw StateError('Konfirmasi server tertunda. Data lokal tetap tersimpan.');
+      });
+    } on FirebaseException catch (error) {
+      if (error.code == 'resource-exhausted' && _firestore != null) {
+        await FirestoreSyncSafety.instance.suspendForQuota(_firestore!);
+        _isOnline = false;
+        _connectionController.add(false);
+      }
+      rethrow;
+    } on StateError catch (error) {
+      FirestoreSyncSafety.instance.report(error.message.toString());
+      rethrow;
+    }
+  }
+
+  void _onCloudError(Object error) {
+    debugPrint('Firestore stream notice: $error');
+    if (error is FirebaseException && error.code == 'resource-exhausted' && _firestore != null) {
+      _isOnline = false;
+      _connectionController.add(false);
+      unawaited(FirestoreSyncSafety.instance.suspendForQuota(_firestore!).catchError((Object _) {}));
+    }
+  }
+
+  Future<T> _cloudRead<T>(Future<T> Function() read) async {
+    try {
+      return await read().timeout(const Duration(seconds: 10));
+    } catch (error) {
+      _onCloudError(error);
+      rethrow;
+    }
+  }
+
+  void _overlayPendingMetadata() {
+    for (final entry in _pendingMetadata.entries) {
+      if (_pendingDeletes.contains(entry.key)) continue;
+      if (entry.key.startsWith('users/')) {
+        final user = UserProfile.fromMap(entry.value);
+        final index = _users.indexWhere((u) => u.id == user.id);
+        if (index < 0) { _users.add(user); } else { _users[index] = user; }
+      } else if (entry.key == 'meta/categories') {
+        _categories..clear()..addAll((entry.value['list'] as List).cast<String>());
+      }
+    }
+  }
+
+  Future<void> _queueMetadata(String path, Map<String, dynamic>? payload) {
+    final operation = _metadataQueue.catchError((Object _) {}).then((_) async {
+      final next = {..._pendingMetadata};
+      if (payload == null) { next.remove(path); } else { next[path] = payload; }
+      final prefs = await SecurePreferences.getInstance();
+      if (!await prefs.setString('firestore_pending_metadata_v1', jsonEncode(next))) {
+        throw StateError('Perubahan belum tersimpan di perangkat.');
+      }
+      _pendingMetadata..clear()..addAll(next);
+    });
+    _metadataQueue = operation;
+    return operation;
+  }
+
+  Future<void> _syncPendingMetadata() async {
+    if (_firestore == null || !_isOnline) return;
+    for (final entry in _pendingMetadata.entries.take(20).toList()) {
+      if (_pendingDeletes.contains(entry.key)) { await _queueMetadata(entry.key, null); continue; }
+      try {
+        await _cloudWrite([entry.key], () => _firestore!.runTransaction((tx) async {
+          final ref = _firestore!.doc(entry.key);
+          final remote = (await tx.get(ref)).data();
+          if (remote != null && (entry.key.startsWith('users/')
+              ? _sameUser(UserProfile.fromMap(remote), UserProfile.fromMap(entry.value))
+              : jsonEncode(_canonicalJson(remote)) == jsonEncode(_canonicalJson(entry.value)))) {
+            return;
+          }
+          tx.set(ref, entry.value, SetOptions(merge: true));
+        }, maxAttempts: 2));
+        // Serialize the comparison with local edits; a newer payload must survive.
+        final operation = _metadataQueue.catchError((Object _) {}).then((_) async {
+          if (jsonEncode(_pendingMetadata[entry.key]) != jsonEncode(entry.value)) return;
+          final next = {..._pendingMetadata}..remove(entry.key);
+          final prefs = await SecurePreferences.getInstance();
+          if (!await prefs.setString('firestore_pending_metadata_v1', jsonEncode(next))) {
+            throw StateError('Konfirmasi belum tersimpan.');
+          }
+          _pendingMetadata..clear()..addAll(next);
+        });
+        _metadataQueue = operation;
+        await operation;
+      } catch (error) { _onCloudError(error); break; }
+    }
+  }
+
+  void _acknowledgeRemote(String path, SnapshotMetadata metadata) {
+    if (!metadata.isFromCache && !metadata.hasPendingWrites) {
+      FirestoreSyncSafety.instance.pendingDocuments.remove(path);
+    }
+  }
+
+  TransactionRecord _readRemoteTransaction(QueryDocumentSnapshot<Map<String, dynamic>> doc) {
+    _acknowledgeRemote('transactions/${doc.id}', doc.metadata);
+    return TransactionRecord.fromMap(doc.data()).copyWith(isSynced: !doc.metadata.hasPendingWrites);
+  }
+
+  Future<void> _deleteCloudDocument(String path) =>
+      _cloudWrite([path], () => _firestore!.doc(path).delete());
+
+  Future<void> _updateDeleteQueue(String path, {required bool add}) {
+    final operation = _deleteQueue.catchError((Object _) {}).then((_) async {
+      final next = Set<String>.from(_pendingDeletes);
+      if (add) { next.add(path); } else { next.remove(path); }
+      final prefs = await SecurePreferences.getInstance();
+      if (!await prefs.setString('firestore_pending_deletes_v1', jsonEncode(next.toList()))) {
+        throw StateError('Antrean penghapusan belum tersimpan.');
+      }
+      _pendingDeletes..clear()..addAll(next);
+    });
+    _deleteQueue = operation;
+    return operation;
+  }
+
+  Future<void> _flushPendingDeletes() => _deletingPending ??= _sendPendingDeletes()
+      .whenComplete(() => _deletingPending = null);
+
+  Future<void> _sendPendingDeletes() async {
+    if (_firestore == null || !_isOnline) return;
+    for (final path in _pendingDeletes.take(20).toList()) {
+      try {
+        final remote = await _cloudRead(() => _firestore!.doc(path).get(const GetOptions(source: Source.server)));
+        if (remote.exists) {
+          if (FirestoreSyncSafety.instance.pendingDocuments.contains(path)) continue;
+          await _deleteCloudDocument(path);
+        }
+        await _updateDeleteQueue(path, add: false);
+      } catch (error) {
+        _onCloudError(error);
+        break;
+      }
+    }
+  }
+
+  Future<void> _bootstrapReferenceData() {
+    return _bootstrapFuture ??= _bootstrapOnce()
+        .whenComplete(() => _bootstrapFuture = null);
+  }
+
+  Future<void> _bootstrapOnce() async {
+    if (_firestore == null || !_isOnline) return;
+    final prefs = await SecurePreferences.getInstance();
+    const key = 'firestore_reference_bootstrap_attempted_v1';
+    if (prefs.getBool(key) == true) { _referenceCheckNeeded = false; return; }
+    // AutomaticSync reserves its persisted retry deadline before reaching here.
+    final firestore = _firestore!;
+    _seedingProducts = true;
+    try {
+      final products = await _cloudRead(() => firestore.collection('products').limit(1)
+          .get(const GetOptions(source: Source.server)));
+      final users = await _cloudRead(() => firestore.collection('users').limit(1)
+          .get(const GetOptions(source: Source.server)));
+      final categories = await _cloudRead(() => firestore.doc('meta/categories')
+          .get(const GetOptions(source: Source.server)));
+      final seeds = <String, Map<String, dynamic>>{};
+      if (products.docs.isEmpty) {
+        for (final p in _products) { seeds['products/${p.id}'] = p.copyWith(isSynced: true).toMap(); }
+      }
+      if (users.docs.isEmpty) {
+        for (final u in _users) { seeds['users/${u.id}'] = u.toMap(); }
+      }
+      if (!categories.exists) seeds['meta/categories'] = {'list': _categories};
+      for (var offset = 0; offset < seeds.length; offset += 100) {
+        final chunk = seeds.entries.skip(offset).take(100).toList();
+        await _cloudWrite(chunk.map((e) => e.key), () => firestore.runTransaction((tx) async {
+          final absent = <String, Map<String, dynamic>>{};
+          for (final entry in chunk) {
+            if (!(await tx.get(firestore.doc(entry.key))).exists) absent[entry.key] = entry.value;
+          }
+          for (final entry in absent.entries) { tx.set(firestore.doc(entry.key), entry.value); }
+        }, maxAttempts: 2));
+      }
+      if (!await prefs.setBool(key, true)) throw StateError('Inisialisasi belum tersimpan.');
+      _referenceCheckNeeded = false;
+    } catch (error) {
+      debugPrint('Firestore reference initialization deferred: $error');
+    } finally {
+      _seedingProducts = false;
+    }
+  }
+
   Future<void>? _pendingSyncFuture;
   final Map<String, int> _activeProductWrites = {};
   final Map<String, int> _activeTransactionWrites = {};
@@ -686,13 +898,6 @@ class PosDatabaseService {
     for (final id in ids) {
       final count = (counts[id] ?? 0) + delta;
       if (count <= 0) { counts.remove(id); } else { counts[id] = count; }
-    }
-  }
-
-  void setOnlineStatus(bool online) {
-    _isOnline = online;
-    if (_isOnline) {
-      _syncPendingOfflineData();
     }
   }
 
@@ -709,14 +914,22 @@ class PosDatabaseService {
   }
 
   Future<void> _runPendingOfflineData() async {
-    await _syncPendingOfflineProducts();
+    await _transactionDeletion?.future;
+    await _flushPendingDeletes();
     await _syncPendingOfflineTransactions();
+    await _syncPendingOfflineProducts();
     await _syncPendingOfflineExpenses();
+    await _syncPendingMetadata();
+    _connectionController.add(_isOnline);
   }
 
-  bool get _hasPendingOfflineData => _products.any((p) => !p.isSynced) ||
+  bool get _hasPendingOfflineData => _pendingMetadata.isNotEmpty || _pendingDeletes.isNotEmpty || _products.any((p) => !p.isSynced) ||
       _transactions.any((t) => !t.isSynced) ||
       _operationalExpenses.any((e) => !e.isSynced);
+
+  int get _pendingItemCount => _pendingMetadata.length + _pendingDeletes.length +
+      _products.where((p) => !p.isSynced).length + _transactions.where((t) => !t.isSynced).length +
+      _operationalExpenses.where((e) => !e.isSynced).length;
 
   static bool _sameProduct(Product a, Product b) =>
       jsonEncode(_canonicalJson(a.copyWith(isSynced: false).toMap())) ==
@@ -753,20 +966,25 @@ class PosDatabaseService {
   }
 
   Future<void> _syncPendingOfflineProducts() async {
-    if (_firestore == null) return;
+    if (_firestore == null || !_isOnline) return;
     if (_seedingProducts) return;
-    final unsynced = _products.where((p) => !p.isSynced && !_activeProductWrites.containsKey(p.id)).toList();
+    final saleProducts = _transactions.where((tx) => !tx.isSynced).expand((tx) => tx.items.map((i) => i.product.id)).toSet();
+    final unsynced = _products.where((p) => !p.isSynced && !saleProducts.contains(p.id) && !_activeProductWrites.containsKey(p.id)).take(20).toList();
     if (unsynced.isEmpty) return;
 
     try {
-      for (var offset = 0; offset < unsynced.length; offset += 10) {
+      for (var offset = 0; offset < unsynced.length && _isOnline; offset += 10) {
         final chunk = unsynced.skip(offset).take(10).toList();
-        final batch = _firestore!.batch();
-        for (final product in chunk) {
-          batch.set(_firestore!.collection('products').doc(product.id),
-              product.copyWith(isSynced: true).toMap(), SetOptions(merge: true));
-        }
-        await batch.commit();
+        await _cloudWrite(chunk.map((p) => 'products/${p.id}'), () => _firestore!.runTransaction((tx) async {
+          final changed = <Product>[];
+          for (final product in chunk) {
+            final data = (await tx.get(_firestore!.doc('products/${product.id}'))).data();
+            if (data == null || !_sameProduct(product, Product.fromMap(data))) changed.add(product);
+          }
+          for (final product in changed) {
+            tx.set(_firestore!.doc('products/${product.id}'), product.copyWith(isSynced: true).toMap(), SetOptions(merge: true));
+          }
+        }, maxAttempts: 2));
         final before = List<Product>.of(_products);
         _acknowledgeProducts(chunk);
         try {
@@ -788,60 +1006,34 @@ class PosDatabaseService {
   }
 
   Future<void> _syncPendingOfflineTransactions() async {
-    if (_firestore == null) return;
-    bool hasChanges = false;
-    final pending = _transactions.where((t) => !t.isSynced && !_activeTransactionWrites.containsKey(t.id)).toList();
-    for (final pendingTx in pending) {
-        try {
-          final syncedTx = pendingTx.copyWith(isSynced: true);
-          final ref = _firestore!.collection('transactions').doc(syncedTx.id);
-          final newer = await _firestore!.runTransaction<TransactionRecord?>((transaction) async {
-            final snapshot = await transaction.get(ref);
-            final data = snapshot.data();
-            if (data != null) {
-              final remote = TransactionRecord.fromMap(data);
-              if (remote.revision > syncedTx.revision || (remote.isVoided && !syncedTx.isVoided)) {
-                return remote.copyWith(isSynced: true);
-              }
-            }
-            transaction.set(ref, syncedTx.toMap(), SetOptions(merge: true));
-            return null;
-          });
-          final index = _transactions.indexWhere((t) => t.id == syncedTx.id);
-          if (index >= 0) {
-            final current = _transactions[index];
-            if (newer != null && (newer.revision > current.revision ||
-                (newer.revision == current.revision && newer.isVoided && !current.isVoided))) {
-              _transactions[index] = newer;
-            } else if (newer == null && _sameTransaction(current, syncedTx)) {
-              _transactions[index] = current.copyWith(isSynced: true);
-            }
-          }
-          hasChanges = true;
-        } catch (e) {
-          debugPrint('Failed to sync transaction ${pendingTx.id}: $e');
-        }
-    }
-    if (hasChanges) {
-      await _persistTransactions();
-      _notifyTransactions();
+    if (_firestore == null || !_isOnline) return;
+    final pending = _transactions.where((t) => !t.isSynced && !_activeTransactionWrites.containsKey(t.id)).toList()
+      ..sort((a, b) => a.createdAt.compareTo(b.createdAt));
+    for (final pendingTx in pending.take(20)) {
+      if (!_isOnline) break;
+      final ids = pendingTx.items.map((i) => i.product.id).toSet();
+      if (!await _syncCheckout(pendingTx, _products.where((p) => ids.contains(p.id)).toList())) break;
     }
   }
 
   Future<void> _syncPendingOfflineExpenses() async {
-    if (_firestore == null) return;
-    final unsynced = _operationalExpenses.where((e) => !e.isSynced && !_activeExpenseWrites.containsKey(e.id)).toList();
+    if (_firestore == null || !_isOnline) return;
+    final unsynced = _operationalExpenses.where((e) => !e.isSynced && !_activeExpenseWrites.containsKey(e.id)).take(20).toList();
     if (unsynced.isEmpty) return;
 
     try {
-      for (var offset = 0; offset < unsynced.length; offset += 100) {
+      for (var offset = 0; offset < unsynced.length && _isOnline; offset += 100) {
         final chunk = unsynced.skip(offset).take(100).toList();
-        final batch = _firestore!.batch();
-        for (final expense in chunk) {
-          batch.set(_firestore!.collection('operational_expenses').doc(expense.id),
-              expense.copyWith(isSynced: true).toMap(), SetOptions(merge: true));
-        }
-        await batch.commit();
+        await _cloudWrite(chunk.map((e) => 'operational_expenses/${e.id}'), () => _firestore!.runTransaction((tx) async {
+          final changed = <OperationalExpense>[];
+          for (final expense in chunk) {
+            final data = (await tx.get(_firestore!.doc('operational_expenses/${expense.id}'))).data();
+            if (data == null || !_sameExpense(expense, OperationalExpense.fromMap(data))) changed.add(expense);
+          }
+          for (final expense in changed) {
+            tx.set(_firestore!.doc('operational_expenses/${expense.id}'), expense.copyWith(isSynced: true).toMap(), SetOptions(merge: true));
+          }
+        }, maxAttempts: 2));
         final before = List<OperationalExpense>.of(_operationalExpenses);
         final updated = acknowledgeExpenses(_operationalExpenses, chunk);
         _operationalExpenses..clear()..addAll(updated);
@@ -863,10 +1055,109 @@ class PosDatabaseService {
     }
   }
 
+  // Keep all sales for today and the barista's 24-hour correction window,
+  // independently of the existing 100-record history subscription.
+  void _watchDailySales() {
+    final firestore = _firestore;
+    if (firestore == null) return;
+    final now = DateTime.now();
+    final day = DateTime(now.year, now.month, now.day);
+    if (_salesDay == day) return;
+    _salesDay = day;
+    _firestoreDailyTransactionsSub?.cancel();
+    _dailyTransactionsSnapshot = [];
+    _firestoreDailyTransactionsSub = firestore.collection('transactions')
+        .where('createdAt', isGreaterThanOrEqualTo: DateTime(now.year, now.month, now.day - 1).toIso8601String())
+        .where('createdAt', isLessThan: DateTime(now.year, now.month, now.day + 1).toIso8601String())
+        .snapshots(includeMetadataChanges: true)
+        .listen((snapshot) async {
+          if (_salesDay != day) return;
+          _dailyTransactionsSnapshot = snapshot.docs.map(_readRemoteTransaction).toList();
+          await _applySalesSnapshots();
+        }, onError: (Object error) {
+          _onCloudError(error);
+        });
+    _notifyTransactions();
+  }
+
+  @visibleForTesting
+  static List<TransactionRecord> mergeSalesSnapshots({
+    required List<TransactionRecord> recent,
+    required List<TransactionRecord> daily,
+    required List<TransactionRecord> local,
+    required DateTime retainSince,
+  }) {
+    final merged = <String, TransactionRecord>{};
+    void merge(TransactionRecord tx) {
+      final previous = merged[tx.id];
+      if (previous == null || (tx.isDeleted && (!previous.isDeleted || tx.revision > previous.revision ||
+          (tx.revision == previous.revision && tx.isSynced && !previous.isSynced))) ||
+          (!previous.isDeleted && (tx.revision > previous.revision ||
+          (tx.revision == previous.revision && (!previous.isVoided || tx.isVoided))))) {
+        merged[tx.id] = tx;
+      }
+    }
+    for (final tx in [...recent, ...daily]) {
+      merge(tx);
+    }
+    for (final tx in local) {
+      final remote = merged[tx.id];
+      if (remote == null) {
+        if (tx.isDeleted || !tx.isSynced || !tx.createdAt.isBefore(retainSince)) merge(tx);
+      } else if (tx.isDeleted || tx.revision > remote.revision || (tx.isVoided && !remote.isVoided)) {
+        merge(tx);
+      }
+    }
+    return merged.values.toList()..sort((a, b) => b.createdAt.compareTo(a.createdAt));
+  }
+
+  Future<void> _applySalesSnapshots() async {
+    await _transactionDeletion?.future;
+    if (_recentTransactionsSnapshot.isEmpty && _dailyTransactionsSnapshot.isEmpty) {
+      _notifyTransactions();
+      return;
+    }
+    final now = DateTime.now();
+    final merged = mergeSalesSnapshots(
+      recent: _recentTransactionsSnapshot,
+      daily: _dailyTransactionsSnapshot,
+      local: _transactions,
+      retainSince: DateTime(now.year, now.month, now.day - 1),
+    );
+    _transactions..clear()..addAll(merged);
+    await _persistTransactions();
+    _notifyTransactions();
+  }
+
   List<Product> getProducts() => List.unmodifiable(_products);
   List<TransactionRecord> getTransactions() => _actor == null ? const [] : List.unmodifiable(
-    _transactions.where((t) => _actor!.role.canViewFinancialReports || t.cashierId == _actor!.id)
+    _transactions.where((t) => !t.isDeleted && (_actor!.role.canViewFinancialReports || t.cashierId == _actor!.id))
       .map((t) => t.copyWith(items: t.items.map((i) => i.copyWith()).toList())));
+  List<TransactionRecord> getDeletedTransactions() {
+    _requireAccess((role) => role.canDeleteTransactions);
+    return List.unmodifiable(_transactions.where((tx) => tx.isDeleted)
+      .map((tx) => tx.copyWith(items: tx.items.map((item) => item.copyWith()).toList())));
+  }
+  bool isTransactionDeleted(String id) {
+    final actor = _actor;
+    final tx = _transactions.where((tx) => tx.id == id).firstOrNull;
+    return actor != null && tx != null && tx.isDeleted && (actor.role.canViewFinancialReports || tx.cashierId == actor.id);
+  }
+  ({double totalAmount, int transactionCount}) getTodaySalesSummary() {
+    _requireAccess((r) => true);
+    final now = DateTime.now();
+    final start = DateTime(now.year, now.month, now.day);
+    final end = DateTime(now.year, now.month, now.day + 1);
+    var total = 0.0;
+    var count = 0;
+    for (final tx in _transactions) {
+      if (!tx.isVoided && !tx.isDeleted && !tx.createdAt.isBefore(start) && tx.createdAt.isBefore(end)) {
+        total += tx.totalAmount;
+        count++;
+      }
+    }
+    return (totalAmount: total, transactionCount: count);
+  }
   List<UserProfile> getUsers() => _actor == null ? const [] : List.unmodifiable(
     _users.where((u) => _actor!.role.canManageUsers || u.id == _actor!.id));
   List<String> getCategories() => List.unmodifiable(_categories);
@@ -884,19 +1175,11 @@ class PosDatabaseService {
     }
     _categories.add(clean);
     _categories.sort();
+    await _queueMetadata('meta/categories', {'list': List<String>.of(_categories)});
     await _persistCategories();
     _notifyCategories();
 
-    if (_firestore != null && _isOnline) {
-      try {
-        await _firestore!
-            .collection('meta')
-            .doc('categories')
-            .set({'list': _categories}, SetOptions(merge: true));
-      } catch (e) {
-        debugPrint('Firestore add category error: $e');
-      }
-    }
+    _requestAutoSync();
     return null;
   }
 
@@ -928,26 +1211,17 @@ class PosDatabaseService {
     final now = DateTime.now();
     for (int i = 0; i < _products.length; i++) {
       if (_products[i].category.toLowerCase() == cleanOld.toLowerCase()) {
-        bool synced = false;
         final updatedProd = _products[i].copyWith(
           category: cleanNew,
           updatedAt: now,
           isSynced: false,
         );
-        if (_firestore != null && _isOnline) {
-          try {
-            await _firestore!
-                .collection('products')
-                .doc(updatedProd.id)
-                .set(updatedProd.copyWith(isSynced: true).toMap());
-            synced = true;
-          } catch (_) {}
-        }
-        _products[i] = updatedProd.copyWith(isSynced: synced);
+        _products[i] = updatedProd;
         productsChanged = true;
       }
     }
 
+    await _queueMetadata('meta/categories', {'list': List<String>.of(_categories)});
     await _persistCategories();
     if (productsChanged) {
       await _persistProducts();
@@ -955,16 +1229,7 @@ class PosDatabaseService {
     }
     _notifyCategories();
 
-    if (_firestore != null && _isOnline) {
-      try {
-        await _firestore!
-            .collection('meta')
-            .doc('categories')
-            .set({'list': _categories}, SetOptions(merge: true));
-      } catch (e) {
-        debugPrint('Firestore update category error: $e');
-      }
-    }
+    _requestAutoSync();
     return null;
   }
 
@@ -997,26 +1262,17 @@ class PosDatabaseService {
     final now = DateTime.now();
     for (int i = 0; i < _products.length; i++) {
       if (_products[i].category.toLowerCase() == clean.toLowerCase()) {
-        bool synced = false;
         final updatedProd = _products[i].copyWith(
           category: fallbackCategory,
           updatedAt: now,
           isSynced: false,
         );
-        if (_firestore != null && _isOnline) {
-          try {
-            await _firestore!
-                .collection('products')
-                .doc(updatedProd.id)
-                .set(updatedProd.copyWith(isSynced: true).toMap());
-            synced = true;
-          } catch (_) {}
-        }
-        _products[i] = updatedProd.copyWith(isSynced: synced);
+        _products[i] = updatedProd;
         productsChanged = true;
       }
     }
 
+    await _queueMetadata('meta/categories', {'list': List<String>.of(_categories)});
     await _persistCategories();
     if (productsChanged) {
       await _persistProducts();
@@ -1024,16 +1280,7 @@ class PosDatabaseService {
     }
     _notifyCategories();
 
-    if (_firestore != null && _isOnline) {
-      try {
-        await _firestore!
-            .collection('meta')
-            .doc('categories')
-            .set({'list': _categories}, SetOptions(merge: true));
-      } catch (e) {
-        debugPrint('Firestore delete category error: $e');
-      }
-    }
+    _requestAutoSync();
     return null;
   }
 
@@ -1081,19 +1328,21 @@ class PosDatabaseService {
     _users[index] = _users[index].copyWith(lastLoginAt: DateTime.now());
     await _persistUsers();
     _notifyUsers();
-    if (_firestore != null && _isOnline) unawaited(_syncSavedUser(_users[index]));
+    if (_firestore != null && _isOnline) unawaited(_syncLoginTime(_users[index]));
   }
 
   Future<UserProfile> changeOwnPassword(String oldPassword, String newPassword) async {
-    final actor = _actor;
-    if (actor == null || !await actor.verifyPasswordAsync(oldPassword)) { throw StateError('Password saat ini tidak valid.'); }
+    _requireAccess((role) => role.canChangeOwnPassword);
+    final actor = _actor!;
+    if (!await actor.verifyPasswordAsync(oldPassword)) { throw StateError('Password saat ini tidak valid.'); }
     if (oldPassword == newPassword) throw ArgumentError('Gunakan password baru yang berbeda.');
     final changed = await actor.withSecurePassword(newPassword);
-    if (_actor?.id != actor.id || _actor?.passwordHash != actor.passwordHash) throw StateError('Sesi sudah berubah.');
+    if (_actor?.id != actor.id || _actor?.passwordHash != actor.passwordHash || _actor?.role.canChangeOwnPassword != true) throw StateError('Sesi sudah berubah.');
+    await _queueMetadata('users/${changed.id}', changed.toMap());
     _users[_users.indexWhere((u) => u.id == actor.id)] = changed;
     await _persistUsers();
     _notifyUsers();
-    if (_firestore != null && _isOnline) unawaited(_syncSavedUser(changed));
+    _requestAutoSync();
     return changed;
   }
 
@@ -1118,6 +1367,8 @@ class PosDatabaseService {
     if (isUsernameTaken(user.username, excludeUserId: user.id)) {
       return 'Username "@${user.username}" sudah digunakan oleh akun lain.';
     }
+    if (existing != null && _sameUser(existing, user)) return null;
+    await _queueMetadata('users/${user.id}', user.toMap());
 
     final index = _users.indexWhere((u) => u.id == user.id);
     if (index != -1) {
@@ -1129,17 +1380,32 @@ class PosDatabaseService {
     _notifyUsers();
 
     // A queued offline cloud write must not prevent local login/session saving.
-    if (_firestore != null && _isOnline) unawaited(_syncSavedUser(user));
+    _requestAutoSync();
     return null;
   }
 
-  Future<void> _syncSavedUser(UserProfile user) async {
+  Future<void> _syncLoginTime(UserProfile user) => _loginSyncs.putIfAbsent(user.id,
+      () => _sendLoginTime(user).whenComplete(() => _loginSyncs.remove(user.id)));
+
+  Future<void> _sendLoginTime(UserProfile user) async {
     try {
-      await _firestore!.collection('users').doc(user.id)
-          .set(user.toMap(), SetOptions(merge: true));
-    } catch (e) {
-      debugPrint('Firestore save user error: $e');
+      final prefs = await SecurePreferences.getInstance();
+      final key = 'firestore_last_login_attempt_${user.id}';
+      final last = prefs.getInt(key) ?? 0;
+      final now = DateTime.now();
+      if (now.millisecondsSinceEpoch - last < const Duration(minutes: 15).inMilliseconds) return;
+      await prefs.setInt(key, now.millisecondsSinceEpoch);
+      await _cloudWrite(['users/${user.id}'], () => _firestore!.doc('users/${user.id}')
+          .update({'lastLoginAt': user.lastLoginAt?.toIso8601String()}));
+    } catch (error) {
+      debugPrint('Firestore login timestamp deferred: $error');
     }
+  }
+
+  static bool _sameUser(UserProfile a, UserProfile b) {
+    final left = a.toMap()..remove('lastLoginAt');
+    final right = b.toMap()..remove('lastLoginAt');
+    return jsonEncode(_canonicalJson(left)) == jsonEncode(_canonicalJson(right));
   }
 
   Future<bool> deleteUser(String userId) async {
@@ -1154,23 +1420,26 @@ class PosDatabaseService {
       return false; // Primary owner protected
     }
 
-    _users.removeAt(index);
+    await _updateDeleteQueue('users/$userId', add: true);
+    await _queueMetadata('users/$userId', null);
+    _users.removeWhere((u) => u.id == userId);
     await _persistUsers();
     _notifyUsers();
 
-    if (_firestore != null && _isOnline) {
-      try {
-        await _firestore!.collection('users').doc(userId).delete();
-      } catch (e) {
-        debugPrint('Firestore delete user error: $e');
-      }
-    }
+    _requestAutoSync();
     return true;
   }
 
-  Future<TransactionRecord> processTransaction(
-    TransactionRecord transaction,
-  ) async {
+  bool _savingCheckout = false;
+  Future<TransactionRecord> processTransaction(TransactionRecord transaction) async {
+    if (_transactionDeletion != null) throw StateError('Penghapusan transaksi sedang disimpan.');
+    if (_savingCheckout) throw StateError('Pembayaran sedang disimpan.');
+    _savingCheckout = true;
+    try { return await _saveCheckout(transaction); }
+    finally { _savingCheckout = false; }
+  }
+
+  Future<TransactionRecord> _saveCheckout(TransactionRecord transaction) async {
     _requireAccess((r) => true);
     if (_correctingTransaction) throw StateError('Koreksi transaksi sedang diproses.');
     transaction = transaction.copyWith(items: transaction.items.map((i) => i.copyWith()).toList());
@@ -1181,10 +1450,11 @@ class PosDatabaseService {
     }
     final now = DateTime.now();
     final updatedProducts = <String, Product>{};
+    final nextProducts = List<Product>.of(_products);
     for (final item in transaction.items) {
       final productIndex = _products.indexWhere((p) => p.id == item.product.id);
       if (productIndex != -1) {
-        final current = _products[productIndex];
+        final current = nextProducts[productIndex];
         // Entertainment rental items (minStockThreshold == 0 && isEntertainment) keep service capacity high
         final newStock = current.isEntertainment && current.minStockThreshold == 0
             ? current.stock
@@ -1196,20 +1466,29 @@ class PosDatabaseService {
           isSynced: false,
         );
 
-        _products[productIndex] = updatedProd;
+        nextProducts[productIndex] = updatedProd;
         updatedProducts[updatedProd.id] = updatedProd;
       }
     }
 
     final finalTransaction = transaction.copyWith(isSynced: false);
+    final nextBills = _openBills.where((b) => b.id != transaction.openBillId).toList();
+    final prefs = await SecurePreferences.getInstance();
+    if (!await prefs.setString('cached_ledger_v1', jsonEncode({
+      'products': nextProducts.map((p) => p.toMap()).toList(),
+      'transactions': [finalTransaction, ..._transactions].map((t) => t.toMap()).toList(),
+      'openBills': nextBills.map((b) => b.toMap()).toList(),
+    }))) {
+      throw StateError('Pembayaran belum tersimpan di perangkat.');
+    }
+    // No cloud worker can observe this sale before the durable commit succeeds.
     _transactions.insert(0, finalTransaction);
-
-    await _persistProducts();
-    await _persistTransactions();
-
+    for (final entry in updatedProducts.entries) {
+      final index = _products.indexWhere((p) => p.id == entry.key);
+      if (index >= 0) _products[index] = entry.value;
+    }
     if (transaction.openBillId != null) {
       _openBills.removeWhere((b) => b.id == transaction.openBillId);
-      await _persistOpenBills();
       _openBillsController.add(getOpenBills());
     }
 
@@ -1218,7 +1497,7 @@ class PosDatabaseService {
 
     // Persist the sale locally before waiting for a server acknowledgement.
     if (_firestore != null && _isOnline) {
-      unawaited(_syncCheckout(finalTransaction, updatedProducts.values.toList()));
+      _requestAutoSync();
     }
 
     return finalTransaction.copyWith(items: finalTransaction.items.map((i) => i.copyWith()).toList());
@@ -1231,7 +1510,7 @@ class PosDatabaseService {
         transaction.items.length > 200 || !RegExp(r'^[A-Za-z0-9_-]{1,100}$').hasMatch(transaction.id) ||
         transaction.id != transaction.invoiceNumber ||
         transaction.discountAmount < 0 || transaction.totalAmount < 0 ||
-        !['Cash', 'QRIS'].contains(transaction.paymentMethod) || transaction.isVoided ||
+        !['Cash', 'QRIS'].contains(transaction.paymentMethod) || transaction.isVoided || transaction.isDeleted ||
         transaction.cashierId != _actor!.id || transaction.cashierName != _actor!.displayName) {
       throw ArgumentError('Transaksi tidak valid.');
     }
@@ -1289,57 +1568,138 @@ class PosDatabaseService {
       jsonEncode(_canonicalJson(a.copyWith(isSynced: false).toMap())) ==
       jsonEncode(_canonicalJson(b.copyWith(isSynced: false).toMap()));
 
-  Future<void> _syncCheckout(TransactionRecord transaction, List<Product> products) async {
-    _trackWrites(_activeTransactionWrites, [transaction.id], 1);
+  @visibleForTesting
+  static ({TransactionRecord sale, Map<String, Product> products, bool writeSale}) planCheckoutSync({
+    required TransactionRecord local,
+    required TransactionRecord? remote,
+    required Map<String, Product> localProducts,
+    required Map<String, Product> remoteProducts,
+  }) {
+    if (remote?.isDeleted == true) {
+      return (sale: remote!.copyWith(isSynced: true), products: <String, Product>{}, writeSale: false);
+    }
+    if (local.isDeleted && remote != null) {
+      final original = local.toMap()
+        ..remove('isDeleted')..remove('deletedAt')..remove('deletedById')..remove('deletedByName')..remove('deletionReason')
+        ..remove('isSynced');
+      if (local.revision <= 1) { original.remove('revision'); } else { original['revision'] = local.revision - 1; }
+      original['isVoided'] = remote.isVoided ? 1 : 0;
+      final server = remote.toMap()..remove('isSynced');
+      if (jsonEncode(_canonicalJson(original)) != jsonEncode(_canonicalJson(server))) {
+        throw StateError('Transaksi berubah di perangkat lain. Penghapusan menunggu pemeriksaan; data server tidak diubah.');
+      }
+    }
+    if (remote != null) {
+      if (remote.revision > local.revision || (remote.isVoided && !local.isVoided)) {
+        return (sale: remote.copyWith(isSynced: true), products: <String, Product>{}, writeSale: false);
+      }
+      if (!local.isDeleted && !_sameTransaction(remote, local.copyWith(isVoided: remote.isVoided))) {
+        throw StateError('Transaksi berbeda dengan data server. Data lokal dipertahankan.');
+      }
+      if (!local.isDeleted && remote.isVoided == local.isVoided) {
+        return (sale: remote.copyWith(isSynced: true), products: <String, Product>{}, writeSale: false);
+      }
+    }
+    final quantities = <String, int>{};
+    for (final item in local.items) {
+      quantities[item.product.id] = (quantities[item.product.id] ?? 0) + item.quantity;
+    }
+    final updates = <String, Product>{};
+    final factor = local.isDeleted ? (remote != null && !remote.isVoided ? 1 : 0)
+        : remote == null ? (local.isVoided ? 0 : -1) : 1;
+    if (factor != 0) {
+      for (final entry in quantities.entries) {
+        final cached = localProducts[entry.key];
+        if (cached == null) throw StateError('Menu transaksi belum tersedia. Data lokal dipertahankan.');
+        if (local.isDeleted && remoteProducts[entry.key] == null && !(cached.isEntertainment && cached.minStockThreshold == 0)) {
+          throw StateError('Stok menu server tidak tersedia. Penghapusan menunggu pemeriksaan.');
+        }
+        final product = remoteProducts[entry.key] ?? cached.copyWith(
+          stock: local.items.firstWhere((i) => i.product.id == entry.key).product.stock);
+        if (product.isEntertainment && product.minStockThreshold == 0) continue;
+        final stock = product.stock + factor * entry.value;
+        if (stock < 0 || stock > 99999) throw StateError('Stok server tidak mencukupi. Transaksi lokal menunggu pemeriksaan.');
+        updates[entry.key] = product.copyWith(stock: stock, updatedAt: local.deletedAt ?? local.createdAt, isSynced: true);
+      }
+    }
+    return (sale: local.copyWith(isSynced: true), products: updates, writeSale: true);
+  }
+
+  Future<bool> _syncCheckout(TransactionRecord sale, List<Product> products) async {
+    await _transactionDeletion?.future;
+    _trackWrites(_activeTransactionWrites, [sale.id], 1);
     _trackWrites(_activeProductWrites, products.map((p) => p.id), 1);
     try {
       final firestore = _firestore!;
-      await firestore.runTransaction((operation) async {
-        final txRef = firestore.collection('transactions').doc(transaction.id);
-        final existing = (await operation.get(txRef)).data();
-        if (existing != null) {
-          final remote = TransactionRecord.fromMap(existing);
-          if (remote.revision > transaction.revision || (remote.isVoided && !transaction.isVoided)) {
-            throw StateError('Transaksi sudah dikoreksi atau dibatalkan di perangkat lain.');
-          }
-          final comparable = transaction.copyWith(isVoided: remote.isVoided, isSynced: false);
-          if (!_sameTransaction(remote, comparable)) {
-            throw StateError('Transaksi berbeda dengan data server.');
-          }
-          if (remote.isVoided == transaction.isVoided) return;
-        }
+      final result = await _cloudWrite(['transactions/${sale.id}', ...products.map((p) => 'products/${p.id}')],
+          () => firestore.runTransaction((operation) async {
+        final ref = firestore.doc('transactions/${sale.id}');
+        final data = (await operation.get(ref)).data();
+        final remoteProducts = <String, Product>{};
+        // Read every stock value before writing. The sale ID and inventory
+        // changes commit together, so a retry cannot deduct inventory twice.
         for (final product in products) {
-          operation.set(firestore.collection('products').doc(product.id),
-              product.copyWith(isSynced: true).toMap());
+          final data = (await operation.get(firestore.doc('products/${product.id}'))).data();
+          if (data != null) remoteProducts[product.id] = Product.fromMap(data);
         }
-        operation.set(txRef, transaction.copyWith(isSynced: true).toMap());
-      });
-      for (final product in products) {
-        final index = _products.indexWhere((p) => p.id == product.id);
-        if (index != -1 && _products[index].updatedAt == product.updatedAt &&
-            _products[index].stock == product.stock) {
-          _products[index] = _products[index].copyWith(isSynced: true);
+        final plan = planCheckoutSync(local: sale,
+          remote: data == null ? null : TransactionRecord.fromMap(data),
+          localProducts: {for (final p in products) p.id: p}, remoteProducts: remoteProducts);
+        for (final product in plan.products.values) {
+          operation.set(firestore.doc('products/${product.id}'), product.toMap());
         }
+        if (plan.writeSale) operation.set(ref, plan.sale.toMap());
+        return (sale: plan.sale, products: {...remoteProducts, ...plan.products});
+      }, maxAttempts: 2));
+      final index = _transactions.indexWhere((t) => t.id == sale.id);
+      if (index >= 0 && _transactions[index].revision == sale.revision && _transactions[index].isVoided == sale.isVoided &&
+          _transactions[index].isDeleted == sale.isDeleted) {
+        _transactions[index] = result.sale;
       }
-      final index = _transactions.indexWhere((t) => t.id == transaction.id);
-      if (index != -1 && _transactions[index].isVoided == transaction.isVoided &&
-          _transactions[index].revision == transaction.revision) {
-        _transactions[index] = _transactions[index].copyWith(isSynced: true);
+      for (final entry in result.products.entries) {
+        final index = _products.indexWhere((p) => p.id == entry.key);
+        if (index < 0) continue;
+        final current = _products[index];
+        final before = products.where((p) => p.id == entry.key).first;
+        // Keep edits made while the cloud operation was awaiting confirmation.
+        if (!_sameProduct(current, before)) continue;
+        final outstanding = _transactions.where((tx) => !tx.isSynced && tx.id != sale.id).toList();
+        // A pending deletion can refer to a sale never committed on the server.
+        // Preserve local stock until its atomic sale/stock reconciliation finishes.
+        if (outstanding.any((tx) => tx.isDeleted && tx.items.any((item) => item.product.id == entry.key))) continue;
+        var stock = entry.value.stock;
+        for (final tx in outstanding) {
+          for (final item in tx.items.where((i) => i.product.id == entry.key)) {
+            if (!(current.isEntertainment && current.minStockThreshold == 0)) {
+              stock += (tx.isVoided ? 1 : -1) * item.quantity;
+            }
+          }
+        }
+        final left = current.toMap()..remove('stock')..remove('updatedAt')..remove('isSynced');
+        final right = entry.value.toMap()..remove('stock')..remove('updatedAt')..remove('isSynced');
+        final metadataMatches = jsonEncode(_canonicalJson(left)) == jsonEncode(_canonicalJson(right));
+        final stillPending = outstanding.any((tx) => tx.items.any((i) => i.product.id == entry.key));
+        _products[index] = current.copyWith(stock: stock.clamp(0, 99999), isSynced: metadataMatches && !stillPending);
       }
-      await _persistProducts();
-      await _persistTransactions();
+      await _persistLedger();
       _notifyProducts();
       _notifyTransactions();
-    } catch (e) {
-      debugPrint('Firestore checkout sync pending: $e');
+      return true;
+    } catch (error) {
+      _onCloudError(error);
+      if (!FirestoreSyncSafety.instance.connectionBlocked) {
+        FirestoreSyncSafety.instance.report('Sinkronisasi transaksi tertunda. Data lokal tetap tersimpan.');
+      }
+      return false;
     } finally {
-      _trackWrites(_activeTransactionWrites, [transaction.id], -1);
+      _trackWrites(_activeTransactionWrites, [sale.id], -1);
       _trackWrites(_activeProductWrites, products.map((p) => p.id), -1);
     }
   }
 
   /// Voids a transaction and restores deducted inventory stock
   bool _correctingTransaction = false;
+  bool _voidingTransaction = false;
 
   Future<TransactionRecord> correctTransaction({
     required String transactionId,
@@ -1349,6 +1709,7 @@ class PosDatabaseService {
     required String reason,
   }) async {
     _requireAccess((r) => true);
+    if (_transactionDeletion != null) throw StateError('Penghapusan transaksi sedang disimpan.');
     if (_correctingTransaction) throw StateError('Koreksi transaksi sedang diproses.');
     _correctingTransaction = true;
     try {
@@ -1356,6 +1717,9 @@ class PosDatabaseService {
       final old = _transactions.where((t) => t.id == transactionId).firstOrNull;
       if (old == null || (actor.role != UserRole.owner && old.cashierId != actor.id)) {
         throw StateError('Transaksi tidak ditemukan atau akses ditolak.');
+      }
+      if (!old.isVoided && !old.canBeCorrectedBy(role: actor.role, userId: actor.id)) {
+        throw StateError('Batas edit transaksi barista adalah 24 jam sejak transaksi dibuat.');
       }
       if (old.isVoided || old.revision != expectedRevision) {
         throw StateError('Transaksi sudah berubah atau telah dibatalkan. Buka kembali riwayat.');
@@ -1457,10 +1821,11 @@ class PosDatabaseService {
       }
       if (_firestore != null) {
         if (!_isOnline || !old.isSynced || before.values.any((p) => !p.isSynced)) {
-          throw StateError('Sinkronkan transaksi dan stok, lalu hubungkan internet sebelum koreksi.');
+          throw StateError('Tunggu sinkronisasi otomatis transaksi dan stok selesai sebelum koreksi.');
         }
         final firestore = _firestore!;
-        await firestore.runTransaction((transaction) async {
+        await _cloudWrite(['transactions/${old.id}', ...updates.keys.map((id) => 'products/$id')],
+            () => firestore.runTransaction((transaction) async {
           final txRef = firestore.collection('transactions').doc(old.id);
           final txSnapshot = await transaction.get(txRef);
           final txData = txSnapshot.data();
@@ -1486,11 +1851,14 @@ class PosDatabaseService {
             refs[entry.key] = ref;
           }
           if (_actor?.id != actor.id) throw StateError('Sesi pengguna telah berubah.');
+          if (!remote.canBeCorrectedBy(role: actor.role, userId: actor.id)) {
+            throw StateError('Batas edit transaksi barista adalah 24 jam sejak transaksi dibuat.');
+          }
           for (final entry in updates.entries) {
             transaction.update(refs[entry.key]!, {'stock': entry.value.stock, 'updatedAt': now.toIso8601String(), 'isSynced': 1});
           }
           transaction.set(txRef, corrected.toMap());
-        });
+        }, maxAttempts: 2));
       }
       final current = _transactions.indexWhere((t) => t.id == old.id);
       if (current >= 0 && _transactions[current].revision == old.revision && !_transactions[current].isVoided) {
@@ -1524,32 +1892,112 @@ class PosDatabaseService {
     }
   }
 
+  Future<TransactionRecord> deleteTransaction({
+    required String transactionId, required int expectedRevision, required String reason,
+  }) async {
+    _requireAccess((role) => role.canDeleteTransactions);
+    if (_transactionDeletion != null || _savingCheckout || _correctingTransaction || _voidingTransaction || _pendingSyncFuture != null) {
+      throw StateError('Transaksi sedang diproses atau disinkronkan. Tunggu sebentar lalu coba lagi.');
+    }
+    final actor = _actor!;
+    final index = _transactions.indexWhere((tx) => tx.id == transactionId);
+    if (index < 0) throw StateError('Transaksi tidak ditemukan.');
+    final old = _transactions[index];
+    if (old.isDeleted) throw StateError('Transaksi sudah dihapus.');
+    if (old.revision != expectedRevision) throw StateError('Transaksi sudah berubah. Buka kembali detail sebelum menghapus.');
+    final cleanReason = reason.trim();
+    if (cleanReason.length < 3 || cleanReason.length > 200) throw ArgumentError('Isi alasan penghapusan, 3 sampai 200 karakter.');
+    final barrier = Completer<void>();
+    _transactionDeletion = barrier;
+    try {
+      final now = DateTime.now();
+      final products = List<Product>.of(_products);
+      final quantities = <String, int>{};
+      if (!old.isVoided) {
+        for (final item in old.items) {
+          if (item.quantity < 1) throw StateError('Jumlah item transaksi tidak valid.');
+          quantities[item.product.id] = (quantities[item.product.id] ?? 0) + item.quantity;
+        }
+      }
+      for (final entry in quantities.entries) {
+        final productIndex = products.indexWhere((product) => product.id == entry.key);
+        if (productIndex < 0) throw StateError('Menu transaksi tidak tersedia. Stok belum dapat dikembalikan.');
+        final product = products[productIndex];
+        if (product.isEntertainment && product.minStockThreshold == 0) continue;
+        final stock = product.stock + entry.value;
+        if (stock > 99999) throw StateError('Pengembalian melebihi batas stok. Periksa inventori terlebih dahulu.');
+        products[productIndex] = product.copyWith(stock: stock, updatedAt: now, isSynced: false);
+      }
+      final deleted = old.copyWith(isDeleted: true, isVoided: true, isSynced: false, revision: old.revision + 1,
+        deletedAt: now, deletedById: actor.id, deletedByName: actor.displayName, deletionReason: cleanReason);
+      final sales = List<TransactionRecord>.of(_transactions);
+      sales[index] = deleted;
+      final prefs = await SecurePreferences.getInstance();
+      _requireAccess((role) => role.canDeleteTransactions);
+      if (_actor!.id != actor.id) throw StateError('Sesi pengguna sudah berubah.');
+      if (!await prefs.setString('cached_ledger_v1', jsonEncode({
+        'products': products.map((product) => product.toMap()).toList(),
+        'transactions': sales.map((tx) => tx.toMap()).toList(),
+        'openBills': _openBills.map((bill) => bill.toMap()).toList(),
+      }))) {
+        throw StateError('Penghapusan belum tersimpan di perangkat.');
+      }
+      _products..clear()..addAll(products);
+      _transactions..clear()..addAll(sales);
+      _notifyProducts();
+      _notifyTransactions();
+      _requestAutoSync();
+      return deleted.copyWith(items: deleted.items.map((item) => item.copyWith()).toList());
+    } finally {
+      _transactionDeletion = null;
+      barrier.complete();
+    }
+  }
+
   Future<bool> voidTransaction(String transactionId) async {
+    if (_transactionDeletion != null) throw StateError('Penghapusan transaksi sedang disimpan.');
     _requireAccess((r) => r.canVoidTransactions);
     if (_correctingTransaction) throw StateError('Koreksi transaksi sedang diproses.');
+    if (_voidingTransaction) throw StateError('Pembatalan transaksi sedang disimpan.');
+    _voidingTransaction = true;
+    try {
     final index = _transactions.indexWhere((t) => t.id == transactionId);
     if (index < 0 || _transactions[index].isVoided) return false;
     final transaction = _transactions[index];
     final updates = <String, Product>{};
+    final nextProducts = List<Product>.of(_products);
     final now = DateTime.now();
     for (final item in transaction.items) {
       final productIndex = _products.indexWhere((p) => p.id == item.product.id);
       if (productIndex < 0) continue;
-      final product = _products[productIndex];
+      final product = nextProducts[productIndex];
       final stock = product.isEntertainment && product.minStockThreshold == 0
           ? product.stock : (product.stock + item.quantity).clamp(0, 99999);
       final updated = product.copyWith(stock: stock, updatedAt: now, isSynced: false);
-      _products[productIndex] = updated;
+      nextProducts[productIndex] = updated;
       updates[updated.id] = updated;
     }
     final voided = transaction.copyWith(isVoided: true, isSynced: false);
+    final nextTransactions = List<TransactionRecord>.of(_transactions);
+    nextTransactions[index] = voided;
+    final prefs = await SecurePreferences.getInstance();
+    if (!await prefs.setString('cached_ledger_v1', jsonEncode({
+      'products': nextProducts.map((p) => p.toMap()).toList(),
+      'transactions': nextTransactions.map((t) => t.toMap()).toList(),
+      'openBills': _openBills.map((b) => b.toMap()).toList(),
+    }))) {
+      throw StateError('Pembatalan belum tersimpan di perangkat.');
+    }
     _transactions[index] = voided;
-    await _persistProducts();
-    await _persistTransactions();
+    for (final entry in updates.entries) {
+      final current = _products.indexWhere((p) => p.id == entry.key);
+      if (current >= 0) _products[current] = entry.value;
+    }
     _notifyProducts();
     _notifyTransactions();
-    if (_firestore != null && _isOnline) unawaited(_syncCheckout(voided, updates.values.toList()));
+    if (_firestore != null && _isOnline) _requestAutoSync();
     return true;
+    } finally { _voidingTransaction = false; }
   }
 
   static const maxBatchInsertItems = 100;
@@ -1593,7 +2041,7 @@ class PosDatabaseService {
       _products.addAll(saved);
       _notifyProducts();
       if (_firestore != null && _isOnline) {
-        unawaited(_syncInsertedBatch(products: saved));
+        _requestAutoSync();
       }
     });
   }
@@ -1601,7 +2049,7 @@ class PosDatabaseService {
   Future<void> addOperationalExpenses(List<OperationalExpense> expenses) {
     final input = List<OperationalExpense>.of(expenses);
     return _enqueueBatchInsert(() async {
-      _requireAccess((r) => r.canViewFinancialReports);
+      _requireAccess((r) => r.canManageOperationalExpenses);
       _validateBatchSize(input.length);
       final ids = _operationalExpenses.map((e) => e.id).toSet();
       for (final expense in input) {
@@ -1615,7 +2063,7 @@ class PosDatabaseService {
       }
       final saved = input.map((e) => e.copyWith(isSynced: false)).toList();
       final prefs = await SecurePreferences.getInstance();
-      _requireAccess((r) => r.canViewFinancialReports);
+      _requireAccess((r) => r.canManageOperationalExpenses);
       final next = [..._operationalExpenses, ...saved]
         ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
       final persisted = await prefs.setString('cached_operational_expenses',
@@ -1625,50 +2073,42 @@ class PosDatabaseService {
       _sortOperationalExpenses();
       _notifyOperationalExpenses();
       if (_firestore != null && _isOnline) {
-        unawaited(_syncInsertedBatch(expenses: saved));
+        _requestAutoSync();
       }
     });
   }
 
-  Future<void> _syncInsertedBatch({
-    List<Product> products = const [],
-    List<OperationalExpense> expenses = const [],
-  }) async {
-    _trackWrites(_activeProductWrites, products.map((p) => p.id), 1);
-    _trackWrites(_activeExpenseWrites, expenses.map((e) => e.id), 1);
-    try {
-      final batch = _firestore!.batch();
-      for (final product in products) {
-        batch.set(_firestore!.collection('products').doc(product.id),
-            product.copyWith(isSynced: true).toMap());
-      }
-      for (final expense in expenses) {
-        batch.set(_firestore!.collection('operational_expenses').doc(expense.id),
-            expense.copyWith(isSynced: true).toMap());
-      }
-      await batch.commit();
-      for (final product in products) {
-        final index = _products.indexWhere((p) => identical(p, product));
-        if (index >= 0) _products[index] = product.copyWith(isSynced: true);
-      }
-      for (final expense in expenses) {
-        final index = _operationalExpenses.indexWhere((e) => identical(e, expense));
-        if (index >= 0) _operationalExpenses[index] = expense.copyWith(isSynced: true);
-      }
-      if (products.isNotEmpty) {
-        await _persistProducts();
-        _notifyProducts();
-      }
-      if (expenses.isNotEmpty) {
-        await _persistOperationalExpenses();
-        _notifyOperationalExpenses();
-      }
-    } catch (e) {
-      debugPrint('Firestore batch insert sync pending: $e');
-    } finally {
-      _trackWrites(_activeProductWrites, products.map((p) => p.id), -1);
-      _trackWrites(_activeExpenseWrites, expenses.map((e) => e.id), -1);
+  Future<void> _saveProductLocally(Product product, {bool insert = false}) async {
+    final next = List<Product>.of(_products);
+    final index = next.indexWhere((p) => p.id == product.id);
+    if (insert) { next.add(product); } else if (index >= 0) { next[index] = product; }
+    final prefs = await SecurePreferences.getInstance();
+    if (!await prefs.setString('cached_ledger_v1', jsonEncode({
+      'products': next.map((p) => p.toMap()).toList(),
+      'transactions': _transactions.map((t) => t.toMap()).toList(),
+      'openBills': _openBills.map((b) => b.toMap()).toList(),
+    }))) {
+      throw StateError('Menu belum tersimpan di perangkat.');
     }
+    final current = _products.indexWhere((p) => p.id == product.id);
+    if (current < 0) { _products.add(product); } else { _products[current] = product; }
+    _notifyProducts();
+    _requestAutoSync();
+  }
+
+  Future<void> _saveExpenseLocally(OperationalExpense expense, {bool insert = false}) async {
+    final next = List<OperationalExpense>.of(_operationalExpenses);
+    final index = next.indexWhere((e) => e.id == expense.id);
+    if (insert) { next.insert(0, expense); } else if (index >= 0) { next[index] = expense; }
+    final prefs = await SecurePreferences.getInstance();
+    if (!await prefs.setString('cached_operational_expenses', jsonEncode(next.map((e) => e.toMap()).toList()))) {
+      throw StateError('Biaya belum tersimpan di perangkat.');
+    }
+    final current = _operationalExpenses.indexWhere((e) => e.id == expense.id);
+    if (current < 0) { _operationalExpenses.add(expense); } else { _operationalExpenses[current] = expense; }
+    _sortOperationalExpenses();
+    _notifyOperationalExpenses();
+    _requestAutoSync();
   }
 
   Future<void> addProduct(Product product) async {
@@ -1680,22 +2120,8 @@ class PosDatabaseService {
       isSynced: false,
     );
 
-    bool synced = false;
-    if (_firestore != null && _isOnline) {
-      try {
-        await _firestore!
-            .collection('products')
-            .doc(stamped.id)
-            .set(stamped.copyWith(isSynced: true).toMap());
-        synced = true;
-      } catch (e) {
-        debugPrint('Firestore add product error: $e');
-      }
-    }
 
-    _products.add(stamped.copyWith(isSynced: synced));
-    await _persistProducts();
-    _notifyProducts();
+    await _saveProductLocally(stamped, insert: true);
   }
 
   Future<void> updateProduct(Product product) async {
@@ -1703,29 +2129,17 @@ class PosDatabaseService {
     _validateProduct(product);
     final index = _products.indexWhere((p) => p.id == product.id);
     if (index == -1) return;
+    final currentValues = _products[index].toMap()..remove('isSynced')..remove('updatedAt');
+    final nextValues = product.toMap()..remove('isSynced')..remove('updatedAt');
+    if (jsonEncode(_canonicalJson(currentValues)) == jsonEncode(_canonicalJson(nextValues))) return;
 
     final stamped = product.copyWith(
       updatedAt: DateTime.now(),
       isSynced: false,
     );
 
-    bool synced = false;
-    if (_firestore != null && _isOnline) {
-      try {
-        // Full document .set() ensures updated or cleared imageUrl syncs across all devices
-        await _firestore!
-            .collection('products')
-            .doc(stamped.id)
-            .set(stamped.copyWith(isSynced: true).toMap());
-        synced = true;
-      } catch (e) {
-        debugPrint('Firestore update product error: $e');
-      }
-    }
 
-    _products[index] = stamped.copyWith(isSynced: synced);
-    await _persistProducts();
-    _notifyProducts();
+    await _saveProductLocally(stamped);
   }
 
   Future<bool> deleteProduct(String productId) async {
@@ -1733,17 +2147,12 @@ class PosDatabaseService {
     final index = _products.indexWhere((p) => p.id == productId);
     if (index == -1) return false;
 
-    _products.removeAt(index);
+    await _updateDeleteQueue('products/$productId', add: true);
+    _products.removeWhere((p) => p.id == productId);
     await _persistProducts();
     _notifyProducts();
 
-    if (_firestore != null && _isOnline) {
-      try {
-        await _firestore!.collection('products').doc(productId).delete();
-      } catch (e) {
-        debugPrint('Firestore delete product error: $e');
-      }
-    }
+    _requestAutoSync();
     return true;
   }
 
@@ -1752,6 +2161,7 @@ class PosDatabaseService {
     if (newStock < 0 || newStock > 99999) throw ArgumentError('Stok tidak valid.');
     final index = _products.indexWhere((p) => p.id == productId);
     if (index == -1) return;
+    if (_products[index].stock == newStock) return;
 
     final updated = _products[index].copyWith(
       stock: newStock.clamp(0, 99999),
@@ -1759,101 +2169,49 @@ class PosDatabaseService {
       isSynced: false,
     );
 
-    bool synced = false;
-    if (_firestore != null && _isOnline) {
-      try {
-        await _firestore!
-            .collection('products')
-            .doc(productId)
-            .set(updated.copyWith(isSynced: true).toMap());
-        synced = true;
-      } catch (e) {
-        debugPrint('Firestore adjust stock error: $e');
-      }
-    }
 
-    _products[index] = updated.copyWith(isSynced: synced);
-    await _persistProducts();
-    _notifyProducts();
+    await _saveProductLocally(updated);
   }
 
   // Operational Expenses CRUD (Listrik, Air, Kantong Plastik, Sedotan, ATK, dll)
   Future<OperationalExpense> addOperationalExpense(
     OperationalExpense expense,
   ) async {
-    _requireAccess((r) => r.canViewFinancialReports);
+    _requireAccess((r) => r.canManageOperationalExpenses);
     if (!expense.amount.isFinite || expense.amount <= 0) throw ArgumentError('Nominal biaya tidak valid.');
-    bool synced = false;
-    if (_firestore != null && _isOnline) {
-      try {
-        final payload = expense.copyWith(isSynced: true);
-        await _firestore!
-            .collection('operational_expenses')
-            .doc(expense.id)
-            .set(payload.toMap());
-        synced = true;
-      } catch (e) {
-        debugPrint('Firestore add operational expense error: $e');
-      }
-    }
 
-    final saved = expense.copyWith(isSynced: synced);
-    _operationalExpenses.insert(0, saved);
-    _sortOperationalExpenses();
-    await _persistOperationalExpenses();
-    _notifyOperationalExpenses();
+    final saved = expense.copyWith(isSynced: false);
+    if (_operationalExpenses.any((e) => e.id == saved.id)) throw StateError('ID biaya sudah digunakan.');
+    await _saveExpenseLocally(saved, insert: true);
     return saved;
   }
 
   Future<OperationalExpense?> updateOperationalExpense(
     OperationalExpense expense,
   ) async {
-    _requireAccess((r) => r.canViewFinancialReports);
+    _requireAccess((r) => r.canManageOperationalExpenses);
     if (!expense.amount.isFinite || expense.amount <= 0) throw ArgumentError('Nominal biaya tidak valid.');
     final index = _operationalExpenses.indexWhere((e) => e.id == expense.id);
     if (index == -1) return null;
+    if (_sameExpense(_operationalExpenses[index], expense)) return _operationalExpenses[index];
 
-    bool synced = false;
-    if (_firestore != null && _isOnline) {
-      try {
-        final payload = expense.copyWith(isSynced: true);
-        await _firestore!
-            .collection('operational_expenses')
-            .doc(expense.id)
-            .set(payload.toMap());
-        synced = true;
-      } catch (e) {
-        debugPrint('Firestore update operational expense error: $e');
-      }
-    }
 
-    final saved = expense.copyWith(isSynced: synced);
-    _operationalExpenses[index] = saved;
-    _sortOperationalExpenses();
-    await _persistOperationalExpenses();
-    _notifyOperationalExpenses();
+    final saved = expense.copyWith(isSynced: false);
+    await _saveExpenseLocally(saved);
     return saved;
   }
 
   Future<bool> deleteOperationalExpense(String expenseId) async {
-    _requireAccess((r) => r.canViewFinancialReports);
+    _requireAccess((r) => r.canManageOperationalExpenses);
     final index = _operationalExpenses.indexWhere((e) => e.id == expenseId);
     if (index == -1) return false;
 
-    _operationalExpenses.removeAt(index);
+    await _updateDeleteQueue('operational_expenses/$expenseId', add: true);
+    _operationalExpenses.removeWhere((e) => e.id == expenseId);
     await _persistOperationalExpenses();
     _notifyOperationalExpenses();
 
-    if (_firestore != null && _isOnline) {
-      try {
-        await _firestore!
-            .collection('operational_expenses')
-            .doc(expenseId)
-            .delete();
-      } catch (e) {
-        debugPrint('Firestore delete operational expense error: $e');
-      }
-    }
+    _requestAutoSync();
     return true;
   }
 
@@ -1863,21 +2221,6 @@ class PosDatabaseService {
         product.baseCost < 0 || product.stock < 0 || product.stock > 99999 || product.minStockThreshold < 0) {
       throw ArgumentError('Data produk tidak valid.');
     }
-  }
-
-  Future<String?> syncForCurrentUser() async {
-    _requireAccess((r) => true);
-    if (_firestore == null) return 'Firebase belum terhubung.';
-    if (!_isOnline) return 'Perangkat offline. Data lokal tetap tersimpan.';
-    try {
-      await _syncPendingOfflineData().timeout(const Duration(seconds: 10));
-      if (_hasPendingOfflineData || _activeProductWrites.isNotEmpty ||
-          _activeTransactionWrites.isNotEmpty || _activeExpenseWrites.isNotEmpty) {
-        return 'Masih ada data menunggu sinkronisasi. Periksa koneksi atau kuota Firebase.';
-      }
-      return null;
-    }
-    catch (_) { return 'Sinkronisasi belum selesai. Data lokal tetap tersimpan.'; }
   }
 
   @visibleForTesting
@@ -1892,9 +2235,7 @@ class PosDatabaseService {
     var writes = 0;
     for (final user in localUsers) {
       final remote = remoteUsers[user.id];
-      if (remote == null ||
-          jsonEncode(_canonicalJson(remote.toMap())) !=
-              jsonEncode(_canonicalJson(user.toMap()))) {
+      if (remote == null || !_sameUser(remote, user)) {
         await writeUser(user);
         writes++;
       }
@@ -1909,45 +2250,15 @@ class PosDatabaseService {
     return writes;
   }
 
-  Future<String?> syncAllToFirestore() async {
-    _requireAccess((r) => r.canManageUsers);
-    if (_firestore == null) return 'Firebase belum terhubung pada perangkat ini.';
-    final pendingError = await syncForCurrentUser();
-    if (pendingError != null) return pendingError;
-    try {
-      final usersSnapshot = await _firestore!.collection('users')
-          .get(const GetOptions(source: Source.server));
-      final categoriesSnapshot = await _firestore!.collection('meta')
-          .doc('categories').get(const GetOptions(source: Source.server));
-      final categoryData = categoriesSnapshot.data()?['list'];
-      await syncChangedMetadata(
-        localUsers: List<UserProfile>.of(_users),
-        remoteUsers: {for (final doc in usersSnapshot.docs)
-          doc.id: UserProfile.fromMap(doc.data())},
-        localCategories: List<String>.of(_categories),
-        remoteCategories: categoryData is List
-            ? categoryData.map((value) => value.toString()).toList() : null,
-        writeUser: (user) => _firestore!.collection('users').doc(user.id)
-            .set(user.toMap(), SetOptions(merge: true)),
-        writeCategories: (categories) => _firestore!.collection('meta')
-            .doc('categories').set({'list': categories}, SetOptions(merge: true)),
-      );
-      return null;
-    } catch (e) {
-      debugPrint('Sync error: $e');
-      return 'Sinkronisasi belum selesai. Data lokal tetap tersimpan.';
-    }
-  }
-
-  Future<void> _persistLedger() async {
+  Future<void> _persistLedger({List<OpenBill>? openBills}) async {
     if (_loading) return;
     final payload = jsonEncode({
       'products': _products.map((p) => p.toMap()).toList(),
       'transactions': _transactions.map((t) => t.toMap()).toList(),
-      'openBills': _openBills.map((b) => b.toMap()).toList(),
+      'openBills': (openBills ?? _openBills).map((b) => b.toMap()).toList(),
     });
     final prefs = await SecurePreferences.getInstance();
-    await prefs.setString('cached_ledger_v1', payload);
+    if (!await prefs.setString('cached_ledger_v1', payload)) throw StateError('Data belum tersimpan di perangkat.');
   }
 
   Future<void> _persistProducts() => _persistLedger();
@@ -2130,7 +2441,18 @@ class PosDatabaseService {
   /// Helper exclusively for clean unit test resets
   @visibleForTesting
   Future<void> resetForTesting() async {
+    dispose();
+    _firestore = null;
+    _isOnline = false;
+    _automaticSync = null;
+    _salesDay = null;
+    _pendingSyncFuture = null;
+    _metadataQueue = Future.value();
     _batchInsertQueue = Future.value();
+    _deleteQueue = Future.value();
+    _deletingPending = null;
+    _recentTransactionsSnapshot = [];
+    _dailyTransactionsSnapshot = [];
     _initialized = false;
     _products.clear();
     _transactions.clear();
@@ -2143,8 +2465,12 @@ class PosDatabaseService {
   }
 
   void dispose() {
+    _automaticSync?.dispose();
+    _networkSub?.cancel();
     _firestoreProductsSub?.cancel();
     _firestoreTransactionsSub?.cancel();
+    _firestoreDailyTransactionsSub?.cancel();
+    _salesDayTimer?.cancel();
     _firestoreUsersSub?.cancel();
     _firestoreCategoriesSub?.cancel();
     _firestoreExpensesSub?.cancel();

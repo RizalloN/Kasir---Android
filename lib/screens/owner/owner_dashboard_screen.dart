@@ -41,7 +41,9 @@ class _OwnerDashboardScreenState extends State<OwnerDashboardScreen>
   @override
   void initState() {
     super.initState();
-    _tabController = TabController(length: 5, vsync: this);
+    _tabController = TabController(
+        length: context.read<PosProvider>().currentRole.canManageUsers ? 5 : 3,
+        vsync: this);
   }
 
   @override
@@ -69,27 +71,27 @@ class _OwnerDashboardScreenState extends State<OwnerDashboardScreen>
                   isScrollable: compactTabs,
                   tabAlignment: compactTabs ? TabAlignment.start : null,
                   indicatorWeight: 2.5,
-                  tabs: const [
-                    Tab(
+                  tabs: [
+                    const Tab(
                       icon: Icon(Icons.space_dashboard_rounded, size: 19),
                       text: 'Ringkasan',
                     ),
-                    Tab(
+                    const Tab(
                       icon: Icon(Icons.inventory_2_outlined, size: 19),
                       text: 'Stok',
                     ),
-                    Tab(
+                    if (access.currentRole.canManageOperationalExpenses) const Tab(
                       icon: Icon(
                         Icons.account_balance_wallet_outlined,
                         size: 19,
                       ),
                       text: 'Operasional',
                     ),
-                    Tab(
+                    const Tab(
                       icon: Icon(Icons.receipt_long_rounded, size: 19),
                       text: 'Histori',
                     ),
-                    Tab(
+                    if (access.currentRole.canManageUsers) const Tab(
                       icon: Icon(Icons.badge_outlined, size: 19),
                       text: 'Staff',
                     ),
@@ -102,9 +104,9 @@ class _OwnerDashboardScreenState extends State<OwnerDashboardScreen>
                   children: [
                     _buildOverviewTab(context),
                     const StockManagementScreen(),
-                    const OperationalExpensesScreen(),
+                    if (access.currentRole.canManageOperationalExpenses) const OperationalExpensesScreen(),
                     const ReportsScreen(),
-                    const UserManagementScreen(isEmbedded: true),
+                    if (access.currentRole.canManageUsers) const UserManagementScreen(isEmbedded: true),
                   ],
                 ),
               ),
@@ -284,7 +286,7 @@ class _OwnerDashboardScreenState extends State<OwnerDashboardScreen>
             icon: Icons.account_balance_wallet_outlined,
             accentColor: AppTheme.roleAdmin,
             accentBg: AppTheme.roleAdminBg,
-            onTap: () => _tabController.animateTo(2),
+            onTap: pos.currentRole.canManageOperationalExpenses ? () => _tabController.animateTo(2) : null,
           ),
           _MetricData(
             title: 'Peringatan Stok',
@@ -494,7 +496,7 @@ class _OwnerDashboardScreenState extends State<OwnerDashboardScreen>
                     ),
                   ),
                   TextButton(
-                    onPressed: () => _tabController.animateTo(3),
+                    onPressed: () => _tabController.animateTo(pos.currentRole.canManageOperationalExpenses ? 3 : 2),
                     child: const Text('Lihat Semua'),
                   ),
                 ],

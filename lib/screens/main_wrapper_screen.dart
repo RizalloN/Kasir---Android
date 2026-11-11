@@ -15,8 +15,10 @@ import 'dialogs/category_management_dialog.dart';
 import 'dialogs/low_stock_alert_dialog.dart';
 import '../services/app_release_service.dart';
 import 'dialogs/app_update_dialog.dart';
-import 'dialogs/open_bills_dialog.dart';
+import 'barista/open_bills_screen.dart';
 import 'dialogs/transaction_history_dialog.dart';
+import 'dialogs/today_sales_dialog.dart';
+import '../services/firestore_sync_safety.dart';
 
 class MainWrapperScreen extends StatefulWidget {
   const MainWrapperScreen({super.key});
@@ -26,7 +28,10 @@ class MainWrapperScreen extends StatefulWidget {
 }
 
 class _MainWrapperScreenState extends State<MainWrapperScreen> {
-  bool _ownerPosMode = false;
+  bool? _cashierMode;
+  int _cashierPage = 0;
+  String? _selectedBillId;
+  int _billSelectionVersion = 0;
 
   @override
   Widget build(BuildContext context) {
@@ -72,7 +77,8 @@ class _MainWrapperScreenState extends State<MainWrapperScreen> {
     }
 
 
-    final isOwner = pos.currentRole == UserRole.owner;
+    final canViewReports = pos.currentRole.canViewFinancialReports;
+    final showReports = canViewReports && !(_cashierMode ?? (pos.currentRole != UserRole.owner));
     final roleColor = AppTheme.roleColor(pos.currentRole);
     final pendingCount = pos.pendingSyncCount;
     final lowStockAlerts = pos.lowStockProducts;
@@ -91,19 +97,21 @@ class _MainWrapperScreenState extends State<MainWrapperScreen> {
                 '${pos.currentUser?.displayName ?? pos.currentRole.shortName} · ${pos.currentRole.shortName}',
           ),
           actions: [
-            if (isOwner)
-              IconButton(tooltip: _ownerPosMode ? 'Dashboard Owner' : 'Buka Kasir',
-                icon: Icon(_ownerPosMode ? Icons.dashboard_outlined : Icons.point_of_sale),
-                onPressed: () => setState(() => _ownerPosMode = !_ownerPosMode)),
+            if (canViewReports)
+              IconButton(tooltip: showReports ? 'Buka Kasir' : 'Dashboard Penjualan',
+                icon: Icon(showReports ? Icons.point_of_sale : Icons.dashboard_outlined),
+                onPressed: () => setState(() { _cashierMode = showReports; if (showReports) _cashierPage = 0; })),
             if (compact)
               PopupMenuButton<String>(
                 tooltip: 'Menu Aplikasi',
                 onSelected: (action) {
                   switch (action) {
+                    case 'sales':
+                      showDialog(context: context, builder: (_) => const TodaySalesDialog());
                     case 'bills':
-                      showDialog(context: context, builder: (_) => OpenBillsDialog(onResumed: () => setState(() => _ownerPosMode = true)));
+                      setState(() { _cashierMode = true; _cashierPage = 1; });
                     case 'history':
-                      showDialog(context: context, builder: (_) => const TransactionHistoryDialog());
+                      setState(() { _cashierMode = true; _cashierPage = 2; });
                     case 'stock':
                       showDialog(context: context, builder: (_) => const LowStockAlertDialog());
                     case 'printer':
@@ -113,12 +121,11 @@ class _MainWrapperScreenState extends State<MainWrapperScreen> {
                     case 'categories':
                       showDialog(context: context, builder: (_) => const CategoryManagementDialog());
                     case 'update':
-                      releases.refresh();
                       showDialog(context: context, builder: (_) => const AppUpdateDialog());
                   }
                 },
                 itemBuilder: (_) => [
-                  const PopupMenuItem(value: 'bills', child: Text('Riwayat Pesanan Belum Dibayar')),
+                  const PopupMenuItem(value: 'sales', child: Text('Penjualan Hari Ini')),
                   const PopupMenuItem(value: 'history', child: Text('Riwayat Transaksi')),
                   if (pos.currentRole.canEditProducts)
                     const PopupMenuItem(value: 'stock', child: Text('Peringatan Stok')),
@@ -132,62 +139,26 @@ class _MainWrapperScreenState extends State<MainWrapperScreen> {
                 ],
               ),
             if (!compact)
-              IconButton(tooltip: 'Riwayat Transaksi', icon: const Icon(Icons.history_rounded),
-                onPressed: () => showDialog(context: context, builder: (_) => const TransactionHistoryDialog())),
-            if (!compact)
-              IconButton(tooltip: 'Riwayat Pesanan Belum Dibayar', icon: Badge(isLabelVisible: pos.openBills.isNotEmpty, label: Text('${pos.openBills.length}'), child: const Icon(Icons.receipt_long_outlined)),
-                onPressed: () => showDialog(context: context, builder: (_) => OpenBillsDialog(onResumed: () => setState(() => _ownerPosMode = true)))),
+              IconButton(tooltip: 'Penjualan Hari Ini', icon: const Icon(Icons.payments_outlined),
+                onPressed: () => showDialog(context: context, builder: (_) => const TodaySalesDialog())),
             if (!compact)
               IconButton(
                 tooltip: releases.updateAvailable ? 'Pembaruan Tersedia' : 'Pembaruan Aplikasi',
                 icon: Badge(isLabelVisible: releases.updateAvailable, child: const Icon(Icons.system_update_rounded)),
                 onPressed: () {
-                  releases.refresh();
                   showDialog(context: context, builder: (_) => const AppUpdateDialog());
                 },
               ),
-            // Minimalist Connection & Sync Dot
+            // Connection state is informational. Only the automatic worker syncs.
             Tooltip(
               message: pos.isOnline
                   ? (pendingCount > 0
-                        ? 'Sinkronkan ($pendingCount tertunda)'
-                        : 'Tersambung · Ketuk untuk sinkronisasi')
-                  : 'Mode Offline · Ketuk untuk sinkronisasi',
-              child: InkWell(
-                onTap: () async {
-                  AppTheme.showToast(
-                    context,
-                    message: 'Menyinkronkan data Warloc...',
-                    icon: Icons.sync_rounded,
-                    duration: const Duration(seconds: 1),
-                  );
-                  final err = await pos.syncAllToCloud();
-                  if (context.mounted) {
-                    if (err == null) {
-                      AppTheme.showToast(
-                        context,
-                        message:
-                            'Seluruh data & foto produk Warloc telah tersinkron ke Firebase.',
-                        icon: Icons.cloud_done_rounded,
-                      );
-                    } else if (err.contains('permission-denied')) {
-                      AppTheme.showToast(
-                        context,
-                        message:
-                            'Izin Firebase ditolak: periksa Rules di Firebase Console.',
-                        isError: true,
-                        duration: const Duration(seconds: 4),
-                      );
-                    } else {
-                      AppTheme.showToast(
-                        context,
-                        message: 'Data disimpan lokal ($err)',
-                        isWarning: true,
-                      );
-                    }
-                  }
-                },
-                borderRadius: BorderRadius.circular(24),
+                        ? 'Sinkronisasi otomatis: $pendingCount data tertunda'
+                        : 'Terhubung ? Sinkronisasi otomatis aktif')
+                  : 'Data tersimpan lokal ? Otomatis disinkronkan saat koneksi pulih',
+              child: Semantics(
+                key: const ValueKey('automatic-sync-status'),
+                label: 'Status sinkronisasi otomatis',
                 child: SizedBox(
                   width: 40,
                   height: 44,
@@ -431,8 +402,36 @@ class _MainWrapperScreenState extends State<MainWrapperScreen> {
               ),
             ),
           ],
+          bottom: showReports ? null : PreferredSize(
+            preferredSize: const Size.fromHeight(66),
+            child: Material(
+              color: AppTheme.cardBg,
+              child: Row(children: [
+                _cashierTab(label: 'Menu', icon: Icons.restaurant_menu_rounded, selected: _cashierPage == 0,
+                  onTap: () => setState(() => _cashierPage = 0)),
+                _cashierTab(label: 'Open Bill', icon: Icons.receipt_long_outlined, selected: _cashierPage == 1,
+                  count: pos.openBills.length, onTap: () => setState(() => _cashierPage = 1)),
+                _cashierTab(label: 'Transaksi', icon: Icons.history_rounded, selected: _cashierPage == 2,
+                  onTap: () => setState(() => _cashierPage = 2)),
+              ]),
+            ),
+          ),
         ),
         body: SafeArea(top: false, child: Column(children: [
+          AnimatedBuilder(
+            animation: FirestoreSyncSafety.instance,
+            builder: (context, _) {
+              final notice = FirestoreSyncSafety.instance.notice;
+              return notice == null ? const SizedBox.shrink() : Material(
+                color: AppTheme.warningLight,
+                child: Padding(padding: const EdgeInsets.all(10), child: Row(children: [
+                  const Icon(Icons.cloud_off_outlined, size: 20),
+                  const SizedBox(width: 8),
+                  Expanded(child: Text(notice)),
+                ])),
+              );
+            },
+          ),
           if (releases.updateAvailable)
             Material(
               color: AppTheme.accentCopperSoft,
@@ -447,12 +446,43 @@ class _MainWrapperScreenState extends State<MainWrapperScreen> {
           duration: const Duration(milliseconds: 180),
           switchInCurve: Curves.easeOutCubic,
           switchOutCurve: Curves.easeInCubic,
-          child: isOwner && !_ownerPosMode
-              ? const OwnerDashboardScreen(key: ValueKey('owner_surface'))
-              : const PosScreen(key: ValueKey('pos_surface')),
+          child: showReports
+              ? OwnerDashboardScreen(key: ValueKey('reports_${pos.currentRole.name}'))
+              : IndexedStack(key: const ValueKey('cashier_workspace'), index: _cashierPage,
+                  children: [PosScreen(key: const ValueKey('pos_surface'), onBillSaved: _billSaved,
+                    onBillCancelled: () => setState(() => _cashierPage = 1)),
+                    OpenBillsScreen(initialBillId: _selectedBillId, selectionVersion: _billSelectionVersion,
+                      onEdit: () => setState(() => _cashierPage = 0), onCreate: () => setState(() => _cashierPage = 0)),
+                    const TransactionHistoryView()]),
         )),
         ])),
       ),
     );
+  }
+  void _billSaved(String id) {
+    FocusManager.instance.primaryFocus?.unfocus();
+    setState(() { _cashierMode = true; _cashierPage = 1; _selectedBillId = id; _billSelectionVersion++; });
+  }
+
+  Widget _cashierTab({required String label, required IconData icon, required bool selected,
+      required VoidCallback onTap, int? count}) {
+    final small = MediaQuery.sizeOf(context).width < 600 || MediaQuery.textScalerOf(context).scale(14) > 19;
+    final text = Text(!small && count != null ? '$label ($count)' : label, maxLines: 1, softWrap: false,
+      style: TextStyle(fontSize: small ? 12 : 14, fontWeight: selected ? FontWeight.w800 : FontWeight.w600,
+        color: selected ? AppTheme.primary : AppTheme.textSecondary));
+    final glyph = Icon(icon, size: 20, color: selected ? AppTheme.accentAmber : AppTheme.textMuted);
+    return Expanded(child: Semantics(selected: selected, button: true,
+      child: InkWell(key: ValueKey('cashier-tab-${label.toLowerCase().replaceAll(' ', '-')}'),
+        onTap: () { FocusManager.instance.primaryFocus?.unfocus(); onTap(); },
+        child: AnimatedContainer(duration: const Duration(milliseconds: 180), height: 66,
+          padding: const EdgeInsets.symmetric(horizontal: 6),
+          decoration: BoxDecoration(color: selected ? AppTheme.accentCopperSoft : AppTheme.cardBg,
+            border: Border(bottom: BorderSide(color: selected ? AppTheme.accentAmber : AppTheme.borderSubtle, width: selected ? 3 : 1))),
+          child: small ? Column(mainAxisAlignment: MainAxisAlignment.center, children: [glyph, const SizedBox(height: 4),
+            FittedBox(fit: BoxFit.scaleDown, child: text)])
+            : Row(mainAxisAlignment: MainAxisAlignment.center, children: [glyph, const SizedBox(width: 8), Flexible(child: text)]),
+        ),
+      ),
+    ));
   }
 }

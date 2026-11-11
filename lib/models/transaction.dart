@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'cart_item.dart';
+import 'user_role.dart';
 
 class TransactionRecord {
   final String id;
@@ -22,6 +23,11 @@ class TransactionRecord {
   final DateTime createdAt;
   final bool isSynced;
   final bool isVoided;
+  final bool isDeleted;
+  final DateTime? deletedAt;
+  final String? deletedById;
+  final String? deletedByName;
+  final String? deletionReason;
   final int revision;
   final List<Map<String, dynamic>> _corrections;
   List<Map<String, dynamic>> get corrections => _corrections.map((entry) =>
@@ -48,6 +54,11 @@ class TransactionRecord {
     required this.createdAt,
     this.isSynced = false,
     this.isVoided = false,
+    this.isDeleted = false,
+    this.deletedAt,
+    this.deletedById,
+    this.deletedByName,
+    this.deletionReason,
     this.revision = 0,
     List<Map<String, dynamic>> corrections = const [],
   }) : _corrections = corrections.map((entry) =>
@@ -55,6 +66,19 @@ class TransactionRecord {
        subtotalAmount = subtotalAmount ?? (totalAmount + discountAmount);
 
   int get totalQuantity => items.fold(0, (sum, item) => sum + item.quantity);
+
+  bool canBeCorrectedBy({
+    required UserRole role,
+    required String userId,
+    DateTime? now,
+  }) {
+    if (isVoided || isDeleted) return false;
+    if (role == UserRole.owner) return true;
+    if (cashierId != userId) return false;
+    if (role != UserRole.barista) return true;
+    final age = (now ?? DateTime.now()).difference(createdAt);
+    return !age.isNegative && age <= const Duration(hours: 24);
+  }
 
   TransactionRecord copyWith({
     String? id,
@@ -77,6 +101,11 @@ class TransactionRecord {
     DateTime? createdAt,
     bool? isSynced,
     bool? isVoided,
+    bool? isDeleted,
+    DateTime? deletedAt,
+    String? deletedById,
+    String? deletedByName,
+    String? deletionReason,
     int? revision,
     List<Map<String, dynamic>>? corrections,
   }) {
@@ -101,6 +130,11 @@ class TransactionRecord {
       createdAt: createdAt ?? this.createdAt,
       isSynced: isSynced ?? this.isSynced,
       isVoided: isVoided ?? this.isVoided,
+      isDeleted: isDeleted ?? this.isDeleted,
+      deletedAt: deletedAt ?? this.deletedAt,
+      deletedById: deletedById ?? this.deletedById,
+      deletedByName: deletedByName ?? this.deletedByName,
+      deletionReason: deletionReason ?? this.deletionReason,
       revision: revision ?? this.revision,
       corrections: corrections ?? this.corrections,
     );
@@ -128,6 +162,13 @@ class TransactionRecord {
       'createdAt': createdAt.toIso8601String(),
       'isSynced': isSynced ? 1 : 0,
       'isVoided': isVoided ? 1 : 0,
+      if (isDeleted) ...{
+        'isDeleted': true,
+        'deletedAt': deletedAt?.toIso8601String(),
+        'deletedById': deletedById,
+        'deletedByName': deletedByName,
+        'deletionReason': deletionReason,
+      },
       if (revision > 0) 'revision': revision,
       if (corrections.isNotEmpty) 'corrections': corrections,
     };
@@ -165,6 +206,11 @@ class TransactionRecord {
           : DateTime.now(),
       isSynced: map['isSynced'] == 1 || map['isSynced'] == true,
       isVoided: map['isVoided'] == 1 || map['isVoided'] == true,
+      isDeleted: map['isDeleted'] == 1 || map['isDeleted'] == true,
+      deletedAt: map['deletedAt'] is String ? DateTime.tryParse(map['deletedAt'] as String) : null,
+      deletedById: map['deletedById'] as String?,
+      deletedByName: map['deletedByName'] as String?,
+      deletionReason: map['deletionReason'] as String?,
       revision: (map['revision'] as num?)?.toInt() ?? 0,
       corrections: (map['corrections'] as List<dynamic>? ?? const [])
           .map((entry) => Map<String, dynamic>.from(entry as Map)).toList(),

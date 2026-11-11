@@ -352,4 +352,21 @@ void main() {
     pos.dispose();
     release.dispose();
   });
+  testWidgets('Connection indicator shows automatic status and exposes no manual sync action', (tester) async {
+    final pos = await tester.runAsync(() => createPos('kasir'));
+    addTearDown(pos!.dispose);
+    final release = AppReleaseService();
+    addTearDown(release.dispose);
+    await tester.pumpWidget(app(pos, release));
+    await tester.pumpAndSettle();
+    final status = find.byKey(const ValueKey('automatic-sync-status'));
+    expect(status, findsOneWidget);
+    expect(find.ancestor(of: status, matching: find.byType(InkWell)), findsNothing);
+    expect(find.textContaining('Ketuk untuk sinkronisasi'), findsNothing);
+    await tester.tap(status);
+    await tester.pump();
+    expect(find.text('Menyinkronkan data Warloc...'), findsNothing);
+    expect(pos.isOnline, isFalse);
+  });
+
 }

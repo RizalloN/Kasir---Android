@@ -10,6 +10,7 @@ import '../../theme/app_theme.dart';
 import '../../utils/currency_formatter.dart';
 import '../dialogs/printer_settings_dialog.dart';
 import '../../services/app_release_service.dart';
+import '../dialogs/delete_transaction_dialog.dart';
 
 class ReceiptDialog extends StatefulWidget {
   final TransactionRecord transaction;
@@ -33,6 +34,9 @@ class _ReceiptDialogState extends State<ReceiptDialog> {
 
   Future<void> _handlePrint(BuildContext context, PosProvider pos, int paperWidth) async {
     if (_isPrinting) return;
+    if (pos.isTransactionDeleted(transaction.id)) {
+      AppTheme.showToast(context, message: 'Transaksi sudah dihapus.', isWarning: true); return;
+    }
     if (!(context.read<AppReleaseService?>()?.enabled('thermal_printer') ?? true)) {
       AppTheme.showToast(context, message: 'Fitur printer dinonaktifkan sementara.', isWarning: true);
       return;
@@ -153,6 +157,13 @@ class _ReceiptDialogState extends State<ReceiptDialog> {
     if (!access.isAuthenticated || access.requiresPasswordChange ||
         (!access.currentRole.canViewFinancialReports && transaction.cashierId != access.currentUser?.id)) { return const AccessDenied(); }
     final pos = context.watch<PosProvider>();
+    if (pos.isTransactionDeleted(transaction.id)) {
+      return AlertDialog(
+      title: const Text('Transaksi sudah dihapus'),
+      content: const Text('Transaksi ini tidak lagi dihitung dalam penjualan. Jejak penghapusan tersedia untuk owner dan admin.'),
+      actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text('Tutup'))],
+    );
+    }
     final paperWidth = pos.printerPaperWidth;
     final maxReceiptWidth = paperWidth == 80 ? 450.0 : 365.0;
     final isVoided = transaction.isVoided;
@@ -453,6 +464,18 @@ class _ReceiptDialogState extends State<ReceiptDialog> {
                               label: const Text('Void / Batalkan Transaksi & Kembalikan Stok'),
                             ),
                           ),
+                        ],
+                        if (allowVoid && pos.currentRole.canDeleteTransactions &&
+                            pos.transactions.any((tx) => tx.id == transaction.id)) ...[
+                          const SizedBox(height: 8),
+                          SizedBox(width: double.infinity, child: TextButton.icon(
+                            onPressed: () async {
+                              final deleted = await showDeleteTransactionDialog(context, transaction);
+                              if (deleted && context.mounted) Navigator.pop(context);
+                            },
+                            style: TextButton.styleFrom(foregroundColor: AppTheme.dangerRed),
+                            icon: const Icon(Icons.delete_outline_rounded, size: 16),
+                            label: const Text('Hapus transaksi', style: TextStyle(fontFamily: 'Roboto')))),
                         ],
                       ],
                     ),

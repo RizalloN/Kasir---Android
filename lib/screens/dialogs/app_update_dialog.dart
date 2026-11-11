@@ -29,6 +29,8 @@ class _AppUpdateDialogState extends State<AppUpdateDialog> {
                 ? 'Versi perangkat belum terbaca.'
                 : 'Terpasang: ${service.installedName} (${service.installedCode})'),
             const SizedBox(height: 12),
+            const Text('Pembaruan otomatis dimatikan. Pemeriksaan hanya dilakukan secara manual.'),
+            const SizedBox(height: 8),
             if (service.isChecking) const LinearProgressIndicator(),
             if (service.error != null) Text(service.error!),
             if (service.updateAvailable) ...[
@@ -43,8 +45,9 @@ class _AppUpdateDialogState extends State<AppUpdateDialog> {
               const SizedBox(height: 8),
               Text('Sumber: ${service.release.downloadUrl!.host}'),
             ] else if (!service.isChecking && service.error == null)
-              const Text(
-                  'Belum ada pembaruan yang diterbitkan untuk perangkat ini.'),
+              Text(service.hasChecked
+                  ? 'Belum ada pembaruan yang diterbitkan untuk perangkat ini.'
+                  : 'Pilih Periksa Pembaruan untuk mengambil informasi rilis terbaru.'),
             if (_downloadError != null) ...[
               const SizedBox(height: 8),
               Text(_downloadError!,
@@ -59,7 +62,7 @@ class _AppUpdateDialogState extends State<AppUpdateDialog> {
             child: const Text('Tutup')),
         TextButton(
           onPressed: service.isChecking ? null : service.refresh,
-          child: const Text('Periksa Lagi'),
+          child: const Text('Periksa Pembaruan'),
         ),
         if (service.updateAvailable)
           FilledButton.icon(

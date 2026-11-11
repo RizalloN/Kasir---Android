@@ -290,7 +290,7 @@ class _BatchInsertDialogState extends State<BatchInsertDialog> {
     if (!pos.isAuthenticated ||
         pos.requiresPasswordChange ||
         !(widget.isExpense
-            ? pos.currentRole.canViewFinancialReports
+            ? pos.currentRole.canManageOperationalExpenses
             : pos.currentRole.canEditProducts)) {
       return const AccessDenied();
     }

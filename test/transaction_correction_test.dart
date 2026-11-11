@@ -364,14 +364,15 @@ void main() {
             home: Scaffold(body: TransactionHistoryDialog()))));
     await tester.pumpAndSettle();
     expect(find.text('Riwayat Transaksi'), findsOneWidget);
-    await tester.tap(find.textContaining('INV-').first);
+    await tester.ensureVisible(find.text('Koreksi'));
+    await tester.tap(find.text('Koreksi'));
     await tester.pumpAndSettle();
     await tester.tap(find.byTooltip('Kurangi item 1'));
     await tester.pump();
     expect(
         find.text('Pengembalian kepada pelanggan: Rp 23.000'), findsOneWidget);
     await tester.enterText(
-        find.widgetWithText(TextField, 'Alasan koreksi'), 'Terinput dua kali');
+        find.byKey(const ValueKey('correction-reason-input')), 'Terinput dua kali');
     await tester.ensureVisible(find.text('Periksa Koreksi'));
     await tester.tap(find.text('Periksa Koreksi'));
     await tester.pumpAndSettle();

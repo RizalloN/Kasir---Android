@@ -1,9 +1,10 @@
-import 'dart:async';
+import 'dart:convert';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
-import 'package:flutter/widgets.dart';
+import 'firestore_sync_safety.dart';
+import 'secure_preferences.dart';
 
 /// Public release metadata only. Never use feature switches as authorization.
 class AppRelease {
@@ -64,15 +65,16 @@ class AppRelease {
   bool enabled(String key) => features[key] ?? true;
 }
 
-class AppReleaseService extends ChangeNotifier with WidgetsBindingObserver {
+class AppReleaseService extends ChangeNotifier {
   static const channel = MethodChannel('com.kafekita.pos/app_release');
   AppRelease release = const AppRelease();
   int? installedCode;
   String installedName = '';
   String? error;
   bool isChecking = false;
+  bool hasChecked = false;
   bool _disposed = false;
-  StreamSubscription<DocumentSnapshot<Map<String, dynamic>>>? _subscription;
+  DateTime? _lastCheckAttempt;
 
   bool get updateAvailable =>
       installedCode != null &&
@@ -81,36 +83,25 @@ class AppReleaseService extends ChangeNotifier with WidgetsBindingObserver {
   bool enabled(String key) => release.enabled(key);
 
   Future<void> initialize() async {
-    WidgetsBinding.instance.addObserver(this);
-    await refresh();
-    if (_disposed || Firebase.apps.isEmpty) return;
-    _subscription = FirebaseFirestore.instance
-        .doc('app_config/android')
-        .snapshots(includeMetadataChanges: true)
-        .listen((snapshot) {
+    // Startup is entirely local. Repository/release changes never trigger reads.
+    try {
+      final info = await channel.invokeMapMethod<String, dynamic>('installedVersion');
       if (_disposed) return;
-      try {
-        release = snapshot.exists
-            ? AppRelease.fromMap(snapshot.data()!)
-            : const AppRelease();
-        // Cached snapshots must not erase a failed server-check message.
-        if (!snapshot.metadata.isFromCache) error = null;
-        notifyListeners();
-      } catch (_) {
-        error =
-            'Konfigurasi rilis tidak valid. Pengaturan terakhir tetap dipakai.';
-        notifyListeners();
-      }
-    }, onError: (Object _) {
-      if (_disposed) return;
-      error =
-          'Kontrol fitur belum terhubung. Pengaturan terakhir tetap dipakai.';
-      notifyListeners();
-    });
+      installedCode = (info?['versionCode'] as num?)?.toInt();
+      installedName = info?['versionName'] as String? ?? '';
+      final prefs = await SecurePreferences.getInstance();
+      final cached = prefs.getString('cached_release_metadata_v1');
+      if (cached != null) release = AppRelease.fromMap(Map<String, dynamic>.from(jsonDecode(cached) as Map));
+    } catch (_) {
+      error = 'Versi aplikasi belum dapat dibaca. Pemeriksaan pembaruan tersedia secara manual.';
+    }
+    if (!_disposed) notifyListeners();
   }
 
   Future<void> refresh() async {
     if (isChecking || _disposed) return;
+    if (_lastCheckAttempt != null && DateTime.now().difference(_lastCheckAttempt!) < const Duration(seconds: 30)) return;
+    _lastCheckAttempt = DateTime.now();
     isChecking = true;
     error = null;
     notifyListeners();
@@ -126,6 +117,7 @@ class AppReleaseService extends ChangeNotifier with WidgetsBindingObserver {
       if (Firebase.apps.isEmpty) {
         throw StateError('Firebase belum terhubung.');
       }
+      if (FirestoreSyncSafety.instance.connectionBlocked) throw StateError('Sinkronisasi ditahan.');
       final snapshot = await FirebaseFirestore.instance
           .doc('app_config/android')
           .get(const GetOptions(source: Source.server))
@@ -135,6 +127,9 @@ class AppReleaseService extends ChangeNotifier with WidgetsBindingObserver {
       release = snapshot.exists
           ? AppRelease.fromMap(snapshot.data()!)
           : const AppRelease();
+      hasChecked = true;
+      final prefs = await SecurePreferences.getInstance();
+      await prefs.setString('cached_release_metadata_v1', jsonEncode(snapshot.data() ?? {}));
     } catch (_) {
       if (!_disposed) {
         error =
@@ -156,15 +151,8 @@ class AppReleaseService extends ChangeNotifier with WidgetsBindingObserver {
   }
 
   @override
-  void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed) unawaited(refresh());
-  }
-
-  @override
   void dispose() {
     _disposed = true;
-    WidgetsBinding.instance.removeObserver(this);
-    _subscription?.cancel();
     super.dispose();
   }
 }

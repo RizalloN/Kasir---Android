@@ -41,9 +41,9 @@ extension UserRoleExtension on UserRole {
   String get permissionSummary {
     switch (this) {
       case UserRole.barista:
-        return 'Transaksi Kasir & Struk';
+        return 'Kasir, Penjualan Harian & Edit 24 Jam';
       case UserRole.admin:
-        return 'Kasir + Inventori & Harga';
+        return 'Kasir, Inventori & Laporan Penjualan';
       case UserRole.owner:
         return 'Akses Penuh (Full Control)';
     }
@@ -52,8 +52,11 @@ extension UserRoleExtension on UserRole {
   bool get canEditProducts => this == UserRole.admin || this == UserRole.owner;
   bool get canManageCategories => this == UserRole.admin || this == UserRole.owner;
   bool get canAdjustStock => this == UserRole.admin || this == UserRole.owner;
-  bool get canViewFinancialReports => this == UserRole.owner;
+  bool get canViewFinancialReports => this == UserRole.admin || this == UserRole.owner;
+  bool get canManageOperationalExpenses => this == UserRole.owner;
   bool get canChangePrices => this == UserRole.admin || this == UserRole.owner;
   bool get canManageUsers => this == UserRole.owner;
+  bool get canChangeOwnPassword => this == UserRole.admin || this == UserRole.owner;
   bool get canVoidTransactions => this == UserRole.owner;
+  bool get canDeleteTransactions => this == UserRole.admin || this == UserRole.owner;
 }

@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:intl/date_symbol_data_local.dart';
 import 'package:kasir_super/models/user_profile.dart';
 import 'package:kasir_super/models/user_role.dart';
 import 'package:kasir_super/providers/pos_provider.dart';
@@ -19,6 +20,7 @@ void main() {
   SecurePreferences.enableTestStorage();
   PosDatabaseService.enableTestMode();
   final db = PosDatabaseService.instance;
+  setUpAll(() => initializeDateFormatting('id_ID', null));
 
   Future<PosProvider> reopen() async {
     final pos = PosProvider();
@@ -191,14 +193,16 @@ void main() {
   );
 
   testWidgets(
-    'admin direct routes deny financial and staff access',
+    'admin can view sales dashboard; expense administration and staff stay restricted',
     (tester) async {
       final pos = (await tester.runAsync(() => fresh('admin')))!;
       addTearDown(pos.dispose);
 
       await tester.pumpWidget(wrap(const OwnerDashboardScreen(), pos));
-      await tester.pump();
-      expect(find.byType(AccessDenied), findsOneWidget);
+      await tester.pumpAndSettle();
+      expect(find.byType(AccessDenied), findsNothing);
+      expect(find.text('Ringkasan'), findsOneWidget);
+      expect(find.widgetWithText(Tab, 'Staff'), findsNothing);
       await tester.pumpWidget(const SizedBox());
 
       await tester.pumpWidget(wrap(const OperationalExpensesScreen(), pos));

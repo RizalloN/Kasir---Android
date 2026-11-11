@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:intl/date_symbol_data_local.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -13,6 +14,7 @@ import 'package:kasir_super/services/pos_database_service.dart';
 import 'package:kasir_super/services/secure_preferences.dart';
 
 void main() {
+  setUpAll(() => initializeDateFormatting('id_ID', null));
   TestWidgetsFlutterBinding.ensureInitialized();
   SecurePreferences.enableTestStorage();
   PosDatabaseService.enableTestMode();
@@ -235,9 +237,12 @@ void main() {
     await tester.pumpAndSettle();
     await tester.enterText(
         find.widgetWithText(TextField, 'Nama / Meja'), 'Meja 8');
-    await tester.ensureVisible(find.text('Simpan Pesanan untuk Diperbaiki'));
+    await tester.ensureVisible(find.text('Unpaid / Open Bill'));
+    await tester.tap(find.text('Unpaid / Open Bill'));
+    await tester.pumpAndSettle();
+    await tester.ensureVisible(find.text('Simpan Open Bill'));
     await tester.runAsync(() async {
-      await tester.tap(find.text('Simpan Pesanan untuk Diperbaiki'));
+      await tester.tap(find.text('Simpan Open Bill'));
       await Future<void>.delayed(const Duration(milliseconds: 50));
     });
     await tester.pumpAndSettle();
@@ -248,8 +253,12 @@ void main() {
     final context = tester.element(find.byType(Scaffold).first);
     showDialog<void>(context: context, builder: (_) => const OpenBillsDialog());
     await tester.pumpAndSettle();
-    expect(find.text('Riwayat Pesanan Belum Dibayar'), findsOneWidget);
+    expect(find.text('Open Bill'), findsOneWidget);
     await tester.tap(find.text('Meja 8'));
+    await tester.pumpAndSettle();
+    expect(pos.cart, isEmpty);
+    await tester.ensureVisible(find.text('Edit pesanan'));
+    await tester.tap(find.text('Edit pesanan'));
     await tester.pumpAndSettle();
     expect(pos.cart.single.drinkVariant, 'ES');
     expect(pos.updateQuantity(coffee.id, -1, variant: 'ES'), isTrue);

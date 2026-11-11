@@ -28,6 +28,8 @@ void main() {
     );
     expect(await sync(user, ['Makanan', 'Coffee']), 0);
     expect(written, isEmpty);
+    expect(await sync(user.copyWith(lastLoginAt: DateTime(2026, 11, 10)), ['Coffee', 'Makanan']), 0);
+    expect(written, isEmpty);
     expect(await sync(user.copyWith(displayName: 'Barista'), ['Coffee', 'Makanan']), 1);
     expect(written, ['u']);
     written.clear();

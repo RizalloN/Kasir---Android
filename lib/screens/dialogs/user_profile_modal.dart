@@ -198,7 +198,7 @@ class UserProfileModal extends StatelessWidget {
               ),
               const SizedBox(height: 18),
 
-              // Owner User Management Shortcut
+              if (role.canChangeOwnPassword) ...[
               SizedBox(
                 width: double.infinity,
                 child: OutlinedButton.icon(
@@ -211,6 +211,7 @@ class UserProfileModal extends StatelessWidget {
                 ),
               ),
               const SizedBox(height: 10),
+              ],
               if (role.canManageUsers) ...[
                 SizedBox(
                   width: double.infinity,

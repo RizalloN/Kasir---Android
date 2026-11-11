@@ -8,14 +8,18 @@ import 'providers/pos_provider.dart';
 import 'screens/main_wrapper_screen.dart';
 import 'theme/app_theme.dart';
 import 'services/app_release_service.dart';
+import 'services/firestore_sync_safety.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
   try {
     await Firebase.initializeApp();
+    await FirestoreSyncSafety.instance.initialize();
     // Configure persistence before either POS sync or release checks use Firestore.
-    FirebaseFirestore.instance.settings = const Settings(persistenceEnabled: true);
+    if (!FirestoreSyncSafety.instance.connectionBlocked) {
+      FirebaseFirestore.instance.settings = const Settings(persistenceEnabled: true);
+    }
   } catch (e) {
     debugPrint('Firebase initialization notice: $e');
   }

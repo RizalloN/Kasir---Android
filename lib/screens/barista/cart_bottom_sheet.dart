@@ -10,10 +10,14 @@ import 'receipt_dialog.dart';
 
 class CartBottomSheet extends StatefulWidget {
   final bool isTabletSidebar;
+  final ValueChanged<String>? onBillSaved;
+  final VoidCallback? onBillCancelled;
 
   const CartBottomSheet({
     super.key,
     this.isTabletSidebar = false,
+    this.onBillSaved,
+    this.onBillCancelled,
   });
 
   @override
@@ -25,6 +29,8 @@ class _CartBottomSheetState extends State<CartBottomSheet> {
   bool _isExactCash = true;
   double _customCashPaid = 0.0;
   bool _checkingOut = false;
+  bool _isPaid = true;
+  String? _observedBillId;
   final TextEditingController _customerController = TextEditingController();
 
   static const List<String> _notePresets = [
@@ -50,6 +56,8 @@ class _CartBottomSheetState extends State<CartBottomSheet> {
     super.initState();
     final pos = context.read<PosProvider>();
     _customerController.text = pos.customerName;
+    _observedBillId = pos.activeBillId;
+    if (_observedBillId != null) _isPaid = false;
   }
 
   @override
@@ -59,14 +67,19 @@ class _CartBottomSheetState extends State<CartBottomSheet> {
   }
 
   Future<void> _saveOrder(PosProvider pos) async {
+    setState(() => _checkingOut = true);
     try {
-      await pos.saveCurrentBill();
+      final bill = await pos.saveCurrentBill();
       if (!mounted) return;
       _customerController.clear();
-      AppTheme.showToast(context, message: 'Pesanan disimpan. Buka riwayat pesanan untuk memperbaikinya sebelum pembayaran.');
+      setState(() => _isPaid = true);
       if (!widget.isTabletSidebar) Navigator.pop(context);
+      if (widget.onBillSaved != null) { widget.onBillSaved!(bill.id); }
+      else { AppTheme.showToast(context, message: 'Open bill tersimpan.'); }
     } catch (e) {
       if (mounted) AppTheme.showToast(context, message: e.toString().replaceFirst('Bad state: ', ''), isError: true);
+    } finally {
+      if (mounted) setState(() => _checkingOut = false);
     }
   }
 
@@ -597,6 +610,11 @@ class _CartBottomSheetState extends State<CartBottomSheet> {
   Widget build(BuildContext context) {
     final pos = context.watch<PosProvider>();
     final subtotal = pos.subtotalCartAmount;
+    if (_observedBillId != pos.activeBillId) {
+      _observedBillId = pos.activeBillId;
+      _isPaid = _observedBillId == null;
+      _isExactCash = true;
+    }
     if (_customerController.text != pos.customerName) {
       _customerController.value = TextEditingValue(
         text: pos.customerName,
@@ -691,22 +709,42 @@ class _CartBottomSheetState extends State<CartBottomSheet> {
                       foregroundColor: AppTheme.dangerRed,
                       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
                     ),
-                    onPressed: () {
+                    onPressed: () async {
+                      final editingBill = pos.activeBillId != null;
+                      if (editingBill) {
+                        final discard = await showDialog<bool>(context: context, builder: (ctx) => AlertDialog(
+                          title: const Text('Batalkan perubahan tagihan?'),
+                          content: const Text('Tagihan yang tersimpan tetap tersedia. Perubahan di keranjang akan dibuang.'),
+                          actions: [TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Lanjut edit')),
+                            TextButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Batal edit'))],
+                        ));
+                        if (!context.mounted || discard != true) return;
+                      }
                       pos.clearCart();
                       _customerController.clear();
                       setState(() => _isExactCash = true);
                       if (!widget.isTabletSidebar) {
                         Navigator.of(context).pop();
                       }
+                      if (editingBill) widget.onBillCancelled?.call();
                     },
                     icon: const Icon(Icons.delete_sweep_outlined, size: 17),
-                    label: const Text('Reset', style: TextStyle(fontSize: 12)),
+                    label: Text(pos.activeBillId == null ? 'Reset' : 'Batal edit', style: const TextStyle(fontSize: 12)),
                   ),
               ],
             ),
           ),
 
           // Dine-In / Takeaway & Customer Bar (Shown when cart has items)
+          if (pos.activeBillId != null) Padding(padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+            child: Container(padding: const EdgeInsets.all(12), decoration: BoxDecoration(
+              color: AppTheme.accentCopperSoft, borderRadius: BorderRadius.circular(10)),
+              child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+                const Text('Mengedit Open Bill', style: TextStyle(fontWeight: FontWeight.w800, color: AppTheme.accentAmber)),
+                const SizedBox(height: 4), Text(pos.customerName, style: const TextStyle(fontWeight: FontWeight.w700)),
+                const SizedBox(height: 4), const Text('Simpan kembali untuk memperbarui tagihan. Pesanan belum dibayar.',
+                  style: TextStyle(fontSize: 12, height: 1.4, color: AppTheme.textSecondary)),
+              ]))),
           if (pos.cart.isNotEmpty) ...[
             Padding(
               padding: const EdgeInsets.fromLTRB(16, 0, 16, 10),
@@ -752,18 +790,6 @@ class _CartBottomSheetState extends State<CartBottomSheet> {
 
           const Divider(height: 1),
           ])),
-
-          if (pos.cart.isNotEmpty)
-            SliverToBoxAdapter(
-              child: Padding(
-                padding: const EdgeInsets.fromLTRB(14, 12, 14, 0),
-                child: OutlinedButton.icon(
-                  onPressed: _checkingOut ? null : () => _saveOrder(pos),
-                  icon: const Icon(Icons.save_outlined),
-                  label: const Text('Simpan Pesanan untuk Diperbaiki'),
-                ),
-              ),
-            ),
 
           // One scroll surface keeps all controls reachable with a keyboard or short window.
           if (pos.cart.isEmpty)
@@ -991,6 +1017,21 @@ class _CartBottomSheetState extends State<CartBottomSheet> {
                     ),
                     const SizedBox(height: 8),
 
+                    const Text('Status Pembayaran',
+                        style: TextStyle(fontWeight: FontWeight.w700)),
+                    const SizedBox(height: 6),
+                    Wrap(spacing: 8, runSpacing: 6, children: [
+                      _buildPaymentStatusChip('Paid / Lunas', selected: _isPaid,
+                          onSelected: () => setState(() => _isPaid = true)),
+                      _buildPaymentStatusChip('Unpaid / Open Bill', selected: !_isPaid,
+                          onSelected: () => setState(() => _isPaid = false)),
+                    ]),
+                    const SizedBox(height: 8),
+                    Text(_isPaid
+                        ? 'Pembayaran langsung untuk Dine-In atau Takeaway.'
+                        : 'Bayar nanti. Isi nama pelanggan / meja untuk membuka tagihan. Belum masuk penjualan.'),
+                    const SizedBox(height: 10),
+                    if (_isPaid) ...[
                     // Payment Method Chips (Cash & QRIS Only)
                     Row(
                       children: [
@@ -1063,6 +1104,7 @@ class _CartBottomSheetState extends State<CartBottomSheet> {
                       ),
                       const SizedBox(height: 10),
                     ],
+                    ],
 
                     // Final Total & Checkout CTA
                     Row(
@@ -1100,9 +1142,13 @@ class _CartBottomSheetState extends State<CartBottomSheet> {
                         Expanded(
                           flex: 6,
                           child: ElevatedButton.icon(
-                            onPressed: isCashShort || _checkingOut
+                            onPressed: (_isPaid && isCashShort) || _checkingOut
                                 ? null
                                 : () async {
+                                    if (!_isPaid) {
+                                      await _saveOrder(pos);
+                                      return;
+                                    }
                                     setState(() => _checkingOut = true);
                                     try {
                                     if (_selectedPaymentMethod == 'QRIS') {
@@ -1146,13 +1192,13 @@ class _CartBottomSheetState extends State<CartBottomSheet> {
                                     }
                                   },
                             icon: Icon(
-                              _selectedPaymentMethod == 'QRIS'
+                              !_isPaid ? Icons.receipt_long_outlined : _selectedPaymentMethod == 'QRIS'
                                   ? Icons.qr_code_scanner_rounded
                                   : Icons.check_circle_outline_rounded,
                               size: 18,
                             ),
                             label: Text(
-                              _selectedPaymentMethod == 'QRIS'
+                              !_isPaid ? pos.activeBillId == null ? 'Simpan Open Bill' : 'Perbarui Open Bill' : _selectedPaymentMethod == 'QRIS'
                                   ? 'Tampilkan QRIS'
                                   : 'Bayar Sekarang',
                             ),
@@ -1224,6 +1270,32 @@ class _CartBottomSheetState extends State<CartBottomSheet> {
           child: Icon(icon, size: 15, color: AppTheme.textMain),
         ),
       ),
+    );
+  }
+
+  Widget _buildPaymentStatusChip(String label, {required bool selected, required VoidCallback onSelected}) {
+    return TweenAnimationBuilder<Color?>(
+      tween: ColorTween(end: selected ? AppTheme.primary : AppTheme.cardBg),
+      duration: const Duration(milliseconds: 200),
+      curve: Curves.easeInOut,
+      builder: (context, background, _) {
+        final color = background ?? AppTheme.cardBg;
+        final luminance = color.computeLuminance();
+        // Keep text readable against every intermediate animation frame.
+        final mainContrast = (luminance + 0.05) / (AppTheme.textMain.computeLuminance() + 0.05);
+        final foreground = mainContrast >= 4.5
+            ? AppTheme.textMain
+            : (luminance + 0.05) / 0.05 >= 4.5 ? Colors.black : Colors.white;
+        return ChoiceChip(
+          label: Text(label),
+          selected: selected,
+          color: WidgetStatePropertyAll(color),
+          labelStyle: TextStyle(color: foreground),
+          checkmarkColor: foreground,
+          side: BorderSide(color: selected ? AppTheme.primary : AppTheme.borderSubtle),
+          onSelected: _checkingOut ? null : (_) => onSelected(),
+        );
+      },
     );
   }
 
