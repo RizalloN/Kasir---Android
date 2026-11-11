@@ -72,12 +72,8 @@ class TransactionRecord {
     required String userId,
     DateTime? now,
   }) {
-    if (isVoided || isDeleted) return false;
-    if (role == UserRole.owner) return true;
-    if (cashierId != userId) return false;
-    if (role != UserRole.barista) return true;
-    final age = (now ?? DateTime.now()).difference(createdAt);
-    return !age.isNegative && age <= const Duration(hours: 24);
+    if (isVoided || isDeleted || !role.canCorrectTransactions) return false;
+    return true;
   }
 
   TransactionRecord copyWith({

@@ -41,7 +41,7 @@ void main() {
   });
   tearDown(() { for (final pos in providers) { pos.dispose(); } providers.clear(); });
 
-  Future<PosProvider> fresh() async {
+  Future<PosProvider> fresh([String role = 'kasir']) async {
     SharedPreferences.setMockInitialValues({});
     await db.resetForTesting();
     final pos = PosProvider(); providers.add(pos);
@@ -49,7 +49,7 @@ void main() {
       await Future<void>.delayed(const Duration(milliseconds: 5));
     }
     expect(pos.initializationError, isNull);
-    expect(await pos.login('warloc.kasir', 'sukses000'), isNull);
+    expect(await pos.login('warloc.$role', role == 'owner' ? 'sukses888' : 'sukses000'), isNull);
     return pos;
   }
 
@@ -104,7 +104,7 @@ void main() {
     expect(find.text('Riwayat Transaksi'), findsNothing);
   });
 
-  testWidgets('History searches local customer/menu data and filters by correction eligibility', (tester) async {
+  testWidgets('Cashier history searches local data and hides correction controls', (tester) async {
     final pos = (await tester.runAsync(fresh))!;
     final tx = (await tester.runAsync(() => sale(pos)))!;
     await tester.runAsync(() => db.insertHistoricalTransactionForTesting(tx.copyWith(
@@ -120,9 +120,9 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.text('Transaksi tidak ditemukan.'), findsOneWidget);
     await tester.enterText(find.byKey(const ValueKey('transaction-search-input')), '');
-    await tester.tap(find.text('Bisa Diedit'));
     await tester.pumpAndSettle();
-    expect(find.text('INV-EXPIRED'), findsNothing);
+    expect(find.text('Bisa Diedit'), findsNothing);
+    expect(find.text('Koreksi'), findsNothing);
     expect(find.text(tx.invoiceNumber), findsOneWidget);
   });
 
@@ -130,12 +130,10 @@ void main() {
     testWidgets('History and correction are arranged within $size at large text', (tester) async {
       tester.view.physicalSize = size; tester.view.devicePixelRatio = 1;
       addTearDown(tester.view.resetPhysicalSize); addTearDown(tester.view.resetDevicePixelRatio);
-      final pos = (await tester.runAsync(fresh))!;
+      final pos = (await tester.runAsync(() => fresh('owner')))!;
       final tx = (await tester.runAsync(() => sale(pos)))!;
       final scale = size.width == 1280 ? 1.0 : 1.5;
-      await tester.pumpWidget(app(pos, const MainWrapperScreen(), scale: scale));
-      await tester.pumpAndSettle();
-      await tester.tap(find.byKey(const ValueKey('cashier-tab-transaksi')));
+      await tester.pumpWidget(app(pos, const Scaffold(body: TransactionHistoryView()), scale: scale));
       await tester.pumpAndSettle();
       await tester.scrollUntilVisible(find.text('Koreksi'), 180,
         scrollable: find.descendant(of: find.byType(TransactionHistoryView), matching: find.byType(Scrollable)).first);
@@ -164,7 +162,7 @@ void main() {
   testWidgets('Review points to the required reason and the form remains scrollable with a keyboard', (tester) async {
     tester.view.physicalSize = const Size(360, 640); tester.view.devicePixelRatio = 1;
     addTearDown(tester.view.resetPhysicalSize); addTearDown(tester.view.resetDevicePixelRatio);
-    final pos = (await tester.runAsync(fresh))!;
+    final pos = (await tester.runAsync(() => fresh('owner')))!;
     final tx = (await tester.runAsync(() => sale(pos)))!;
     await tester.pumpWidget(app(pos, Scaffold(body: Builder(builder: (context) => TextButton(
       onPressed: () => showDialog<void>(context: context, builder: (_) => CorrectTransactionDialog(transaction: tx)),
@@ -183,7 +181,7 @@ void main() {
   testWidgets('Wide correction aligns equal columns and keeps labels outside the input borders', (tester) async {
     tester.view.physicalSize = const Size(1280, 800); tester.view.devicePixelRatio = 1;
     addTearDown(tester.view.resetPhysicalSize); addTearDown(tester.view.resetDevicePixelRatio);
-    final pos = (await tester.runAsync(fresh))!;
+    final pos = (await tester.runAsync(() => fresh('owner')))!;
     final tx = (await tester.runAsync(() => sale(pos)))!;
     await tester.pumpWidget(app(pos, Scaffold(body: CorrectTransactionDialog(transaction: tx))));
     await tester.pumpAndSettle();
@@ -218,7 +216,7 @@ void main() {
     testWidgets('Long menu names, large amounts and fields fit $scenario', (tester) async {
       tester.view.physicalSize = scenario.size; tester.view.devicePixelRatio = 1;
       addTearDown(tester.view.resetPhysicalSize); addTearDown(tester.view.resetDevicePixelRatio);
-      final pos = (await tester.runAsync(fresh))!;
+      final pos = (await tester.runAsync(() => fresh('owner')))!;
       final tx = (await tester.runAsync(() => sale(pos)))!;
       final item = tx.items.first.copyWith(quantity: 99999, product: tx.items.first.product.copyWith(
         name: List.filled(6, 'Kopi Susu Gula Aren Spesial Warloc').join(' '), sellPrice: 999999));

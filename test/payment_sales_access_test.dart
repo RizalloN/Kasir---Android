@@ -76,12 +76,13 @@ void main() {
   Widget wrap(Widget child, PosProvider pos) => ChangeNotifierProvider.value(
     value: pos, child: MaterialApp(home: Scaffold(body: child)));
 
-  test('Barista edit deadline is exactly 24 hours from original creation', () async {
+  test('Barista cannot correct transactions, including their own recent sale', () async {
     final pos = await fresh('kasir');
     final tx = await sale(pos);
     final id = pos.currentUser!.id;
     final deadline = tx.createdAt.add(const Duration(hours: 24));
-    expect(tx.canBeCorrectedBy(role: UserRole.barista, userId: id, now: deadline), isTrue);
+    expect(tx.canBeCorrectedBy(role: UserRole.barista, userId: id, now: tx.createdAt), isFalse);
+    expect(tx.canBeCorrectedBy(role: UserRole.barista, userId: id, now: deadline), isFalse);
     expect(tx.canBeCorrectedBy(role: UserRole.barista, userId: id,
         now: deadline.add(const Duration(microseconds: 1))), isFalse);
     expect(tx.copyWith(revision: 9).canBeCorrectedBy(role: UserRole.barista, userId: id,
@@ -92,10 +93,10 @@ void main() {
     expect(tx.copyWith(isVoided: true).canBeCorrectedBy(role: UserRole.owner, userId: id), isFalse);
   });
 
-  test('Expired edits are rejected by provider and database without changing stock or audit', () async {
+  test('Barista edits are rejected by provider and database without changing stock or audit', () async {
     var pos = await fresh('kasir');
     final tx = await sale(pos);
-    final expired = tx.copyWith(createdAt: DateTime.now().subtract(const Duration(hours: 25)));
+    final expired = tx;
     pos = await restoreSales(pos, [expired]);
     final stock = pos.products.firstWhere((p) => p.id == 'w_1').stock;
     expect(pos.canCorrectTransaction(expired), isFalse);
@@ -142,6 +143,7 @@ void main() {
     final settled = await pos.processCheckout(paymentMethod: 'Cash', amountPaid: 20000, cashierName: '');
     expect(pos.openBills, isEmpty);
     expect(pos.todayStoreSales, (totalAmount: 89000.0, transactionCount: 4));
+    await login(pos, 'owner');
     await pos.correctTransaction(transactionId: settled.id, expectedRevision: 0,
         items: [settled.items.single.copyWith(quantity: 2)], amountPaid: 50000, reason: 'Kurang item');
     expect(pos.todayStoreSales, (totalAmount: 112000.0, transactionCount: 4));
@@ -165,7 +167,7 @@ void main() {
     expect(pos.transactions.single.id, tx.id);
     expect(pos.currentRole.canViewFinancialReports, isTrue);
     expect(pos.currentRole.canManageUsers, isFalse);
-    expect(pos.canCorrectTransaction(tx), isFalse);
+    expect(pos.canCorrectTransaction(tx), isTrue);
     final expense = OperationalExpense(id: 'expense', title: 'Listrik', category: 'Lainnya',
         amount: 1000, createdAt: DateTime.now(), recordedBy: pos.currentUser!.displayName);
     await expectLater(pos.addOperationalExpense(title: 'Listrik', category: 'Lainnya', amount: 1000), throwsStateError);

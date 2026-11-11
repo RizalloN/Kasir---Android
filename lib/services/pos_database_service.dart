@@ -1708,18 +1708,18 @@ class PosDatabaseService {
     required double amountPaid,
     required String reason,
   }) async {
-    _requireAccess((r) => true);
+    _requireAccess((r) => r.canCorrectTransactions);
     if (_transactionDeletion != null) throw StateError('Penghapusan transaksi sedang disimpan.');
     if (_correctingTransaction) throw StateError('Koreksi transaksi sedang diproses.');
     _correctingTransaction = true;
     try {
       final actor = _actor!;
       final old = _transactions.where((t) => t.id == transactionId).firstOrNull;
-      if (old == null || (actor.role != UserRole.owner && old.cashierId != actor.id)) {
+      if (old == null) {
         throw StateError('Transaksi tidak ditemukan atau akses ditolak.');
       }
       if (!old.isVoided && !old.canBeCorrectedBy(role: actor.role, userId: actor.id)) {
-        throw StateError('Batas edit transaksi barista adalah 24 jam sejak transaksi dibuat.');
+        throw StateError('Transaksi tidak dapat dikoreksi.');
       }
       if (old.isVoided || old.revision != expectedRevision) {
         throw StateError('Transaksi sudah berubah atau telah dibatalkan. Buka kembali riwayat.');
@@ -1852,7 +1852,7 @@ class PosDatabaseService {
           }
           if (_actor?.id != actor.id) throw StateError('Sesi pengguna telah berubah.');
           if (!remote.canBeCorrectedBy(role: actor.role, userId: actor.id)) {
-            throw StateError('Batas edit transaksi barista adalah 24 jam sejak transaksi dibuat.');
+            throw StateError('Transaksi tidak dapat dikoreksi.');
           }
           for (final entry in updates.entries) {
             transaction.update(refs[entry.key]!, {'stock': entry.value.stock, 'updatedAt': now.toIso8601String(), 'isSynced': 1});

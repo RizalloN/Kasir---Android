@@ -1047,7 +1047,7 @@ class PosProvider extends ChangeNotifier {
     required double amountPaid,
     required String reason,
   }) async {
-    _requirePermission(true);
+    _requirePermission(currentRole.canCorrectTransactions);
     if (_checkoutInProgress) throw StateError('Transaksi sedang diproses.');
     final saved = await _db.correctTransaction(
       transactionId: transactionId, expectedRevision: expectedRevision,

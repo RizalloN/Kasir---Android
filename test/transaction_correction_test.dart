@@ -154,28 +154,30 @@ void main() {
     expect(updated.revision, 1);
   });
 
-  test('Cashier can correct their own transaction; another cashier role cannot',
+  test('Admin corrects cashier transaction; cashier cannot correct it',
       () async {
     final pos = await fresh('kasir');
     final tx = await sale(pos);
     expect(await pos.login('warloc.admin', 'sukses123'), isNull);
-    await expectLater(
-        pos.correctTransaction(
+    expect(pos.canCorrectTransaction(tx), isTrue);
+    final corrected = await pos.correctTransaction(
             transactionId: tx.id,
             expectedRevision: 0,
             items: [tx.items.single.copyWith(quantity: 1)],
             amountPaid: 50000,
-            reason: 'Salah'),
-        throwsStateError);
+            reason: 'Salah');
+    expect(corrected.totalAmount, 23000);
+    expect(corrected.revision, 1);
+    expect(corrected.corrections.single['correctedById'], pos.currentUser!.id);
+    expect(pos.products.firstWhere((p) => p.id == 'w_1').stock, 49);
     expect(await pos.login('warloc.kasir', 'sukses000'), isNull);
-    final updated = await pos.correctTransaction(
+    await expectLater(pos.correctTransaction(
         transactionId: tx.id,
-        expectedRevision: 0,
-        items: [tx.items.single.copyWith(quantity: 1)],
+        expectedRevision: 1,
+        items: corrected.items,
         amountPaid: 50000,
-        reason: 'Salah');
-    expect(updated.totalAmount, 23000);
-    expect(updated.corrections.single['correctedById'], pos.currentUser!.id);
+        reason: 'Salah'), throwsStateError);
+    expect(pos.transactions.single.revision, 1);
   });
 
   test(
@@ -325,7 +327,7 @@ void main() {
       tester.view.devicePixelRatio = 1;
       addTearDown(tester.view.resetPhysicalSize);
       addTearDown(tester.view.resetDevicePixelRatio);
-      final pos = (await tester.runAsync(() => fresh('kasir')))!;
+      final pos = (await tester.runAsync(fresh))!;
       final tx = (await tester.runAsync(() => sale(pos)))!;
       await tester.pumpWidget(ChangeNotifierProvider.value(
           value: pos,
@@ -354,10 +356,11 @@ void main() {
     });
   }
 
-  testWidgets('Cashier edits an item through history and confirms a refund',
+  testWidgets('Admin edits cashier transaction through history and confirms a refund',
       (tester) async {
     final pos = (await tester.runAsync(() => fresh('kasir')))!;
     await tester.runAsync(() => sale(pos));
+    expect(await tester.runAsync(() => pos.login('warloc.admin', 'sukses123')), isNull);
     await tester.pumpWidget(ChangeNotifierProvider.value(
         value: pos,
         child: const MaterialApp(

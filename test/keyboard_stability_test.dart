@@ -132,7 +132,7 @@ void main() {
       'Correction reason keeps the IME connection during keyboard animation',
       (tester) async {
     viewport(tester);
-    final pos = (await tester.runAsync(fresh))!;
+    final pos = (await tester.runAsync(() => fresh('owner')))!;
     pos.addToCart(pos.products.firstWhere((p) => p.id == 'w_1'), variant: 'ES');
     final tx = (await tester.runAsync(() => pos.processCheckout(
         paymentMethod: 'Cash', amountPaid: 50000, cashierName: '')))!;

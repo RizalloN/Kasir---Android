@@ -128,14 +128,14 @@ class _TransactionHistoryViewState extends State<TransactionHistoryView> {
             child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
               const Text('Riwayat Transaksi', style: TextStyle(fontSize: 24, fontWeight: FontWeight.w800, color: AppTheme.textMain)),
               const SizedBox(height: 4),
-              Text(pos.currentRole.canViewFinancialReports ? 'Telusuri penjualan dan periksa transaksi.' : 'Periksa pesanan Anda dan koreksi jika ada kesalahan input.',
+              Text(pos.currentRole.canViewFinancialReports ? 'Telusuri penjualan dan periksa transaksi.' : 'Periksa riwayat transaksi Anda.',
                 style: const TextStyle(color: AppTheme.textSecondary, height: 1.5)),
               const SizedBox(height: 18),
               _HistoryInput(id: 'transaction-search', label: 'Cari transaksi', hint: 'Invoice, pelanggan, atau nama menu',
                 prefix: const Icon(Icons.search_rounded),
                 onChanged: (value) => setState(() => _query = value)),
               const SizedBox(height: 12),
-              Wrap(spacing: 8, runSpacing: 6, children: [for (final filter in ['Semua', 'Hari Ini', 'Bisa Diedit', if (pos.currentRole.canDeleteTransactions) 'Terhapus'])
+              Wrap(spacing: 8, runSpacing: 6, children: [for (final filter in ['Semua', 'Hari Ini', if (pos.currentRole.canCorrectTransactions) 'Bisa Diedit', if (pos.currentRole.canDeleteTransactions) 'Terhapus'])
                 ChoiceChip(label: Text(filter), selected: _filter == filter, showCheckmark: false,
                   selectedColor: AppTheme.accentCopperSoft,
                   labelStyle: TextStyle(color: _filter == filter ? AppTheme.accentAmber : AppTheme.textSecondary,
